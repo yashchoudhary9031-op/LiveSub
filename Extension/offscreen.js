@@ -2,16 +2,20 @@
 
 const BACKEND_WS = "ws://localhost:8000/ws";
 const BACKEND_HTTP = "http://localhost:8000";
+const CHUNK_DURATION_MS = 1500; // 1.5s slice: optimal for Whisper large-v3-turbo low latency
 
 let mediaStream = null;
 let audioContext = null;
-let mediaRecorder = null;
+let analyser = null;
+let audioDataArray = null;
 let ws = null;
 let isRecording = false;
+let isPaused = false;
 let currentTabId = null;
 let currentTargetLang = "hi";
 let currentLangHint = "";
-let recordingInterval = null;
+let chunkTimer = null;
+let activeRecorder = null;
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === "START_TAB_CAPTURE") {
@@ -20,6 +24,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   } else if (message.action === "STOP_TAB_CAPTURE") {
     stopCapture();
     sendResponse({ status: "stopped" });
+  } else if (message.action === "UPDATE_CONFIG") {
+    if (message.targetLang) currentTargetLang = message.targetLang;
+    if (message.langHint !== undefined) currentLangHint = message.langHint;
+    console.log("[LiveSub Offscreen] Config updated:", { currentTargetLang, currentLangHint });
+    sendResponse({ status: "updated" });
+  } else if (message.action === "VIDEO_STATUS") {
+    isPaused = !!message.paused;
+    console.log("[LiveSub Offscreen] Video playback status:", isPaused ? "PAUSED" : "PLAYING");
+    sendResponse({ status: "ok" });
   }
 });
 
@@ -38,8 +51,8 @@ function initWebSocket() {
     ws.onmessage = (event) => {
       try {
         const cue = JSON.parse(event.data);
-        if (cue && cue.translation && currentTabId) {
-          // Forward subtitle cue to the YouTube content script
+        if (cue && cue.translation && cue.translation.trim() && cue.translation !== "[stub transcript]" && currentTabId) {
+          // Forward subtitle cue to the active YouTube tab
           chrome.tabs.sendMessage(currentTabId, {
             action: "SHOW_CUE",
             cue: cue,
@@ -57,6 +70,10 @@ function initWebSocket() {
 
     ws.onclose = () => {
       ws = null;
+      // Auto-reconnect if recording is still active
+      if (isRecording) {
+        setTimeout(initWebSocket, 2000);
+      }
     };
   } catch (err) {
     console.error("[LiveSub Offscreen] WebSocket init failed:", err);
@@ -69,6 +86,7 @@ async function startCapture(config) {
   currentTabId = config.targetTabId;
   currentTargetLang = config.targetLang || "hi";
   currentLangHint = config.langHint || "";
+  isPaused = false;
 
   initWebSocket();
 
@@ -84,112 +102,154 @@ async function startCapture(config) {
       video: false,
     });
 
-    // 2. Keep audio playing through the user's speakers/headphones
+    // 2. Keep audio playing through user's speakers/headphones
     audioContext = new (window.AudioContext || window.webkitAudioContext)();
     const source = audioContext.createMediaStreamSource(mediaStream);
     source.connect(audioContext.destination);
 
-    // 3. Start slicing audio and streaming to Groq Whisper
-    isRecording = true;
-    startAudioSlices();
+    // 3. Attach real-time audio volume analyser (Voice Activity Check)
+    analyser = audioContext.createAnalyser();
+    analyser.fftSize = 256;
+    audioDataArray = new Uint8Array(analyser.frequencyBinCount);
+    source.connect(analyser);
 
-    console.log("[LiveSub Offscreen] Tab audio capture successfully active");
+    // 4. Start gapless continuous audio slicing
+    isRecording = true;
+    recordNextSlice();
+
+    console.log("[LiveSub Offscreen] Tab audio capture successfully active with 1.5s gapless slices");
   } catch (err) {
     console.error("[LiveSub Offscreen] Failed to start tab audio capture:", err);
   }
 }
 
-function startAudioSlices() {
-  if (recordingInterval) clearInterval(recordingInterval);
+function getAudioRms() {
+  if (!analyser || !audioDataArray) return 1.0;
+  analyser.getByteTimeDomainData(audioDataArray);
+  let sum = 0;
+  for (let i = 0; i < audioDataArray.length; i++) {
+    const val = (audioDataArray[i] - 128) / 128.0;
+    sum += val * val;
+  }
+  return Math.sqrt(sum / audioDataArray.length);
+}
 
-  async function sliceAndSend() {
-    if (!isRecording || !mediaStream || !mediaStream.active) return;
+function recordNextSlice() {
+  if (!isRecording || !mediaStream || !mediaStream.active) return;
 
-    let mimeType = "audio/webm;codecs=opus";
-    if (!MediaRecorder.isTypeSupported(mimeType)) {
-      mimeType = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "";
-    }
-
-    try {
-      const recorder = mimeType ? new MediaRecorder(mediaStream, { mimeType }) : new MediaRecorder(mediaStream);
-      const recordedChunks = [];
-
-      recorder.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0) {
-          recordedChunks.push(e.data);
-        }
-      };
-
-      recorder.onstop = async () => {
-        if (recordedChunks.length === 0) return;
-        const blob = new Blob(recordedChunks, { type: mimeType || "audio/webm" });
-
-        // Skip silence or empty headers
-        if (blob.size < 1200) return;
-
-        const arrayBuffer = await blob.arrayBuffer();
-
-        const configPayload = {
-          chunk_start: Date.now() / 1000.0,
-          rate: 1.0,
-          target_lang: currentTargetLang,
-          lang_hint: currentLangHint || null,
-        };
-
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          // Send metadata JSON, then binary audio slice
-          ws.send(JSON.stringify(configPayload));
-          ws.send(arrayBuffer);
-        } else {
-          // HTTP Fallback to POST /api/transcribe
-          try {
-            const formData = new FormData();
-            formData.append("audio", blob, "chunk.webm");
-            formData.append("chunk_start", 0.0);
-            formData.append("rate", 1.0);
-            formData.append("target_lang", currentTargetLang);
-            if (currentLangHint) formData.append("lang_hint", currentLangHint);
-
-            const res = await fetch(`${BACKEND_HTTP}/api/transcribe`, {
-              method: "POST",
-              body: formData,
-            });
-
-            if (res.ok) {
-              const cue = await res.json();
-              if (cue && cue.translation && currentTabId) {
-                chrome.tabs.sendMessage(currentTabId, {
-                  action: "SHOW_CUE",
-                  cue: cue,
-                }).catch(() => {});
-              }
-            }
-          } catch (e) {}
-        }
-      };
-
-      // Record in 2.6-second slices for near-zero delay transcription
-      recorder.start();
-      setTimeout(() => {
-        if (recorder && recorder.state === "recording") {
-          recorder.stop();
-        }
-      }, 2600);
-    } catch (e) {
-      console.warn("[LiveSub Offscreen] Slice recording error:", e);
-    }
+  if (isPaused) {
+    // If user paused YouTube video, check again in 300ms without wasting CPU
+    chunkTimer = setTimeout(recordNextSlice, 300);
+    return;
   }
 
-  sliceAndSend();
-  recordingInterval = setInterval(sliceAndSend, 2800);
+  let mimeType = "audio/webm;codecs=opus";
+  if (!MediaRecorder.isTypeSupported(mimeType)) {
+    mimeType = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "";
+  }
+
+  try {
+    const recorder = mimeType ? new MediaRecorder(mediaStream, { mimeType }) : new MediaRecorder(mediaStream);
+    activeRecorder = recorder;
+    const recordedChunks = [];
+
+    recorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) {
+        recordedChunks.push(e.data);
+      }
+    };
+
+    recorder.onstop = async () => {
+      if (recordedChunks.length === 0) return;
+      const blob = new Blob(recordedChunks, { type: mimeType || "audio/webm" });
+
+      // If audio chunk is too small or silence, skip sending to avoid Whisper hallucinations
+      if (blob.size < 800) return;
+
+      const rms = getAudioRms();
+      if (rms < 0.003) {
+        // Pure silence (e.g. video quiet pause)
+        return;
+      }
+
+      sendAudioSlice(blob);
+    };
+
+    recorder.start();
+
+    // Gapless chaining: schedule next slice at exactly CHUNK_DURATION_MS
+    chunkTimer = setTimeout(() => {
+      if (isRecording) {
+        // Start next recorder immediately on the active stream (zero dead zone!)
+        recordNextSlice();
+      }
+      if (recorder.state === "recording") {
+        recorder.stop();
+      }
+    }, CHUNK_DURATION_MS);
+
+  } catch (err) {
+    console.warn("[LiveSub Offscreen] Slice recording error:", err);
+    chunkTimer = setTimeout(recordNextSlice, CHUNK_DURATION_MS);
+  }
+}
+
+async function sendAudioSlice(blob) {
+  try {
+    const arrayBuffer = await blob.arrayBuffer();
+
+    const configPayload = {
+      chunk_start: Date.now() / 1000.0,
+      rate: 1.0,
+      target_lang: currentTargetLang,
+      lang_hint: currentLangHint || null,
+    };
+
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(configPayload));
+      ws.send(arrayBuffer);
+    } else {
+      // Fallback: POST /api/transcribe
+      const formData = new FormData();
+      formData.append("audio", blob, "chunk.webm");
+      formData.append("chunk_start", 0.0);
+      formData.append("rate", 1.0);
+      formData.append("target_lang", currentTargetLang);
+      if (currentLangHint) formData.append("lang_hint", currentLangHint);
+
+      const res = await fetch(`${BACKEND_HTTP}/api/transcribe`, {
+        method: "POST",
+        body: formData,
+      });
+
+      if (res.ok) {
+        const cue = await res.json();
+        if (cue && cue.translation && cue.translation.trim() && cue.translation !== "[stub transcript]" && currentTabId) {
+          chrome.tabs.sendMessage(currentTabId, {
+            action: "SHOW_CUE",
+            cue: cue,
+          }).catch(() => {});
+        }
+      }
+    }
+  } catch (e) {
+    console.warn("[LiveSub Offscreen] Error sending audio slice:", e);
+  }
 }
 
 function stopCapture() {
   isRecording = false;
 
-  if (recordingInterval) {
-    clearInterval(recordingInterval);
-    recordingInterval = null;
+  if (chunkTimer) {
+    clearTimeout(chunkTimer);
+    chunkTimer = null;
+  }
+
+  if (activeRecorder && activeRecorder.state === "recording") {
+    try {
+      activeRecorder.stop();
+    } catch (e) {}
+    activeRecorder = null;
   }
 
   if (mediaStream) {
@@ -202,6 +262,8 @@ function stopCapture() {
       audioContext.close();
     } catch (e) {}
     audioContext = null;
+    analyser = null;
+    audioDataArray = null;
   }
 
   if (ws) {

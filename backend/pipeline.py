@@ -60,17 +60,31 @@ def _transcribe_groq(audio_bytes: bytes, lang_hint: Optional[str] = None) -> Dic
             "file": file_tuple,
             "model": "whisper-large-v3-turbo",
             "response_format": "verbose_json",
+            "temperature": 0.0,
         }
         if lang_hint:
             params["language"] = lang_hint
 
         result = client.audio.transcriptions.create(**params)
-        text = getattr(result, "text", "") or ""
+        raw_text = getattr(result, "text", "") or ""
         detected_lang = getattr(result, "language", lang_hint or "en") or "en"
-        duration = getattr(result, "duration", 2.0) or 2.0
+        duration = getattr(result, "duration", 1.5) or 1.5
+
+        # Filter out common Whisper silence hallucinations
+        hallucinations = {
+            "thank you.", "thank you", "thank you very much.", "thanks for watching.",
+            "subtitles by amara.org", "please subscribe", "subscribe to my channel",
+            "bye.", "bye", "you", "...", "[music]", "(music)", "[applause]",
+            "watching!", "thank you for watching!", "thanks for watching!"
+        }
+        stripped = raw_text.strip()
+        if stripped.lower() in hallucinations or len(stripped) <= 1:
+            clean_text = ""
+        else:
+            clean_text = stripped
 
         return {
-            "text": text.strip(),
+            "text": clean_text,
             "lang": detected_lang,
             "duration": float(duration),
         }
@@ -192,7 +206,10 @@ def build_cue(
     detected_lang = stt_res.get("lang", lang_hint or "hi")
     audio_duration = float(stt_res.get("duration", 2.0))
 
-    translated_text = translate(original_text, src=detected_lang, target=target_lang)
+    if not original_text or not original_text.strip():
+        translated_text = ""
+    else:
+        translated_text = translate(original_text, src=detected_lang, target=target_lang)
 
     # Convert audio offsets to video timeline seconds
     start_time = to_video_time(chunk_start, 0.0, rate)

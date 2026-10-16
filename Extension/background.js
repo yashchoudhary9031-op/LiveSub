@@ -38,7 +38,19 @@ async function startSession(settings) {
     // Ensure tab is a YouTube tab or valid URL
     if (!activeTab.url || !activeTab.url.includes("youtube.com")) return;
 
+    if (isCapturing) {
+      // If already capturing, seamlessly update target language / hint
+      chrome.runtime.sendMessage({
+        action: "UPDATE_CONFIG",
+        targetLang: settings.targetLang || "hi",
+        langHint: settings.langHint || "",
+      }).catch(() => {});
+      return;
+    }
+
     await setupOffscreenDocument();
+    // Allow offscreen document event listener setup
+    await new Promise((r) => setTimeout(r, 100));
 
     // Get real tab audio stream ID
     const streamId = await new Promise((resolve) => {
