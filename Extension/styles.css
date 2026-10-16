@@ -34,15 +34,14 @@
   white-space: pre-wrap;
 }
 
-/* Optional styling for original vs translated line */
-.livesub-translation {
-  color: #ffeb3b; /* Crisp subtitle yellow */
-  font-size: 1.05em;
-}
-
 .livesub-original {
   font-size: 0.8em;
   color: #cfd8dc;
-  margin-top: 2px;
+  margin-bottom: 2px;
   font-weight: 400;
+}
+
+.livesub-translation {
+  color: #ffeb3b;
+  font-size: 1.05em;
 }

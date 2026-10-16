@@ -19,6 +19,7 @@ let mediaRecorder = null;
 let chunkInterval = null;
 let currentCueTimeout = null;
 let lastTranslatedText = "";
+let subtitleHistory = [];
 
 // ----------------------------------------------------------------------------
 // 1. Initialize & Inject Overlay
@@ -44,14 +45,34 @@ function initOverlay() {
 function showSubtitle(translation, original = null) {
   if (!captionBox || !overlayContainer) return;
 
-  let html = `<div class="livesub-translation">${escapeHtml(translation)}</div>`;
+  let html = "";
   if (original && original !== translation) {
     html += `<div class="livesub-original">${escapeHtml(original)}</div>`;
   }
+  html += `<div class="livesub-translation">${escapeHtml(translation)}</div>`;
 
   captionBox.innerHTML = html;
   captionBox.style.fontSize = state.fontSize;
   overlayContainer.classList.remove("hidden");
+}
+
+function recordSubtitle(translation, original, start, end) {
+  if (!translation) return;
+
+  const cueStart = Number.isFinite(Number(start)) ? Number(start) : (videoElement?.currentTime || 0);
+  const cueEnd = Number.isFinite(Number(end)) && Number(end) > cueStart
+    ? Number(end)
+    : cueStart + 2.5;
+  const cue = {
+    start: cueStart,
+    end: cueEnd,
+    original: original || "",
+    translation,
+  };
+  const previous = subtitleHistory[subtitleHistory.length - 1];
+
+  if (previous && previous.start === cue.start && previous.translation === cue.translation) return;
+  subtitleHistory.push(cue);
 }
 
 function hideSubtitle() {
@@ -101,13 +122,14 @@ function connectWebSocket() {
   }
 
   try {
-    ws = new WebSocket(BACKEND_WS);
+    const socket = new WebSocket(BACKEND_WS);
+    ws = socket;
 
-    ws.onopen = () => {
+    socket.onopen = () => {
       console.log("[LiveSub] WebSocket connected to backend");
     };
 
-    ws.onmessage = (event) => {
+    socket.onmessage = (event) => {
       try {
         const cue = JSON.parse(event.data);
         if (cue.error) {
@@ -118,6 +140,7 @@ function connectWebSocket() {
         // Display cue with synchronization
         if (cue.translation) {
           showSubtitle(cue.translation, cue.text);
+          recordSubtitle(cue.translation, cue.text, cue.start, cue.end);
 
           // Clear previous timeout and schedule hide after duration
           if (currentCueTimeout) clearTimeout(currentCueTimeout);
@@ -131,14 +154,14 @@ function connectWebSocket() {
       }
     };
 
-    ws.onclose = () => {
-      console.log("[LiveSub] WebSocket disconnected");
-      ws = null;
+    socket.onclose = (event) => {
+      console.log(`[LiveSub] WebSocket disconnected (code ${event.code}${event.reason ? `: ${event.reason}` : ""})`);
+      if (ws === socket) ws = null;
     };
 
-    ws.onerror = (err) => {
-      console.warn("[LiveSub] WebSocket error, will retry on next chunk:", err);
-      ws = null;
+    socket.onerror = () => {
+      console.warn(`[LiveSub] WebSocket connection failed at ${BACKEND_WS}; will retry on next chunk`);
+      if (ws === socket) ws = null;
     };
   } catch (err) {
     console.error("[LiveSub] Could not open WebSocket:", err);
@@ -153,6 +176,9 @@ function startAudioStreaming() {
   // Periodically send chunk configuration and trigger transcription
   chunkInterval = setInterval(async () => {
     if (!state.enabled || !videoElement || videoElement.paused) return;
+    if (!ws || ws.readyState === WebSocket.CLOSED) {
+      connectWebSocket();
+    }
 
     const chunkStart = videoElement.currentTime;
     const playbackRate = videoElement.playbackRate || 1.0;
@@ -190,6 +216,7 @@ function startAudioStreaming() {
         if (res.ok) {
           const cue = await res.json();
           showSubtitle(cue.translation, cue.text);
+          recordSubtitle(cue.translation, cue.text, cue.start, cue.end);
         }
       } catch (err) {
         // Backend not reached
@@ -244,6 +271,7 @@ function startCaptionObserver() {
           if (res.ok) {
             const data = await res.json();
             showSubtitle(data.translation, rawText);
+            recordSubtitle(data.translation, rawText, videoElement?.currentTime, (videoElement?.currentTime || 0) + 2.5);
           }
         } catch (e) {
           console.warn("[LiveSub] Translation error:", e);
@@ -309,6 +337,14 @@ chrome.storage.local.get(
 );
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.action === "EXPORT_SUBTITLES") {
+    sendResponse({
+      subtitles: subtitleHistory,
+      title: document.title.replace(/\s*-\s*YouTube$/, "").trim() || "LiveSub subtitles",
+    });
+    return;
+  }
+
   if (request.action === "SETTINGS_CHANGED") {
     state = request.settings;
     if (captionBox) {
@@ -326,6 +362,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
 // Re-hook on YouTube SPA navigation
 window.addEventListener("yt-navigate-finish", () => {
+  subtitleHistory = [];
+  lastTranslatedText = "";
   initOverlay();
   bindVideo();
   if (state.enabled && videoElement && !videoElement.paused) {

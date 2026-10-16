@@ -78,6 +78,18 @@
       </div>
     </section>
 
+    <section class="section export-section">
+      <label for="exportFormat">Export translated subtitles</label>
+      <div class="export-controls">
+        <select id="exportFormat" class="form-select" aria-label="Subtitle file format">
+          <option value="srt">SRT</option>
+          <option value="txt">TXT</option>
+        </select>
+        <button id="exportButton" type="button">Export</button>
+      </div>
+      <div id="exportStatus" class="export-status" role="status" aria-live="polite"></div>
+    </section>
+
     <!-- Footer Status -->
     <footer class="footer">
       <div id="footerStatus" class="footer-msg">Backend: http://localhost:8000</div>
