@@ -10,7 +10,7 @@
   text-align: center;
   max-width: 85%;
   width: auto;
-  transition: opacity 0.15s ease-in-out;
+  transition: opacity 0.2s ease-in-out;
 }
 
 #livesub-container.hidden {
@@ -20,40 +20,29 @@
 
 .livesub-caption-box {
   display: inline-block;
-  background-color: rgba(10, 10, 10, 0.88);
+  background-color: rgba(8, 8, 8, 0.82);
   color: #ffffff;
-  padding: 8px 18px;
-  border-radius: 8px;
+  padding: 6px 14px;
+  border-radius: 6px;
   font-family: "YouTube Noto", Roboto, "Segoe UI", Arial, sans-serif;
   font-weight: 600;
-  line-height: 1.45;
+  line-height: 1.4;
   letter-spacing: 0.3px;
-  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.95);
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.4);
   word-wrap: break-word;
   white-space: pre-wrap;
-  border: 1px solid rgba(255, 255, 255, 0.12);
 }
 
-/* Translated target subtitle (Crisp Yellow) */
+/* Optional styling for original vs translated line */
 .livesub-translation {
-  color: #FFE500;
-  font-size: 1.15em;
-  font-weight: 700;
+  color: #ffeb3b; /* Crisp subtitle yellow */
+  font-size: 1.05em;
 }
 
-/* Original subtitle line (Clean Light Gray) */
 .livesub-original {
-  font-size: 0.85em;
-  color: #CFD8DC;
-  margin-top: 3px;
-  font-weight: 500;
-}
-
-/* Hide YouTube's native subtitle elements when LiveSub is active */
-body.livesub-active .ytp-caption-window-bottom,
-body.livesub-active .caption-window,
-body.livesub-active .ytp-caption-window-container {
-  opacity: 0 !important;
-  pointer-events: none !important;
+  font-size: 0.8em;
+  color: #cfd8dc;
+  margin-top: 2px;
+  font-weight: 400;
 }
