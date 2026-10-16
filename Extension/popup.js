@@ -90,7 +90,7 @@ function loadSettings() {
   chrome.storage.local.get(
     {
       enabled: false,
-      targetLang: "en",
+      targetLang: "hi",
       langHint: "",
       subMode: "audio_stt",
       fontSize: "22px",
@@ -105,7 +105,7 @@ function loadSettings() {
   );
 }
 
-// 3. Save settings & notify active tab
+// 3. Save settings & notify background + active tab
 function saveSettings() {
   const settings = {
     enabled: elements.enabledToggle.checked,
@@ -116,15 +116,20 @@ function saveSettings() {
   };
 
   chrome.storage.local.set(settings, () => {
+    // Notify background audio session
+    if (settings.enabled && settings.subMode === "audio_stt") {
+      chrome.runtime.sendMessage({ action: "START_AUDIO_SESSION", settings: settings }).catch(() => {});
+    } else {
+      chrome.runtime.sendMessage({ action: "STOP_AUDIO_SESSION" }).catch(() => {});
+    }
+
     // Notify active YouTube tab
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       if (tabs[0] && tabs[0].id) {
         chrome.tabs.sendMessage(tabs[0].id, {
           action: "SETTINGS_CHANGED",
           settings: settings,
-        }).catch(() => {
-          // Tab may not be YouTube or content script not yet injected
-        });
+        }).catch(() => {});
       }
     });
   });

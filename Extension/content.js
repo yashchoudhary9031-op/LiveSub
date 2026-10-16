@@ -168,17 +168,72 @@ function connectWebSocket() {
   }
 }
 
+let audioCaptureStream = null;
+
+async function getAudioStream() {
+  if (!videoElement) return null;
+
+  // 1. Try HTML5 video.captureStream()
+  if (!audioCaptureStream || !audioCaptureStream.active) {
+    try {
+      const vStream = videoElement.captureStream ? videoElement.captureStream() : (videoElement.mozCaptureStream ? videoElement.mozCaptureStream() : null);
+      if (vStream) {
+        const audioTracks = vStream.getAudioTracks();
+        if (audioTracks && audioTracks.length > 0) {
+          audioCaptureStream = new MediaStream(audioTracks);
+        }
+      }
+    } catch (e) {
+      console.warn("[LiveSub] captureStream unavailable:", e);
+    }
+  }
+
+  // 2. Fallback to tabCapture stream if available
+  if (!audioCaptureStream || !audioCaptureStream.active) {
+    try {
+      const response = await chrome.runtime.sendMessage({ action: "GET_TAB_STREAM_ID" });
+      if (response && response.streamId) {
+        const tabStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            mandatory: {
+              chromeMediaSource: "tab",
+              chromeMediaSourceId: response.streamId,
+            },
+          },
+          video: false,
+        });
+        if (tabStream && tabStream.getAudioTracks().length > 0) {
+          // Keep audio playing through user speakers
+          const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+          const source = audioCtx.createMediaStreamSource(tabStream);
+          source.connect(audioCtx.destination);
+          audioCaptureStream = tabStream;
+        }
+      }
+    } catch (err) {
+      console.warn("[LiveSub] tabCapture fallback:", err);
+    }
+  }
+
+  return audioCaptureStream;
+}
+
+let isRecordingAudioSlice = false;
+
 function startAudioStreaming() {
   connectWebSocket();
 
   if (chunkInterval) clearInterval(chunkInterval);
 
-  // Periodically send chunk configuration and trigger transcription
-  chunkInterval = setInterval(async () => {
+  async function recordAndSendSlice() {
     if (!state.enabled || !videoElement || videoElement.paused) return;
-    if (!ws || ws.readyState === WebSocket.CLOSED) {
+    if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
       connectWebSocket();
     }
+    if (isRecordingAudioSlice) return;
+
+    const stream = await getAudioStream();
+    if (!stream || !stream.active) return;
 
     const chunkStart = videoElement.currentTime;
     const playbackRate = videoElement.playbackRate || 1.0;
@@ -190,39 +245,75 @@ function startAudioStreaming() {
       lang_hint: state.langHint || null,
     };
 
-    // If WebSocket is open, stream through WS
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      // Send text configuration frame
-      ws.send(JSON.stringify(config));
-      // Send binary audio frame (using dummy/simulated slice in stub mode)
-      const dummyAudio = new Uint8Array([0, 1, 2, 3]);
-      ws.send(dummyAudio.buffer);
-    } else {
-      // Fallback: POST /api/transcribe
-      try {
-        const formData = new FormData();
-        const blob = new Blob([new Uint8Array([0, 1, 2, 3])], { type: "audio/webm" });
-        formData.append("audio", blob, "chunk.webm");
-        formData.append("chunk_start", chunkStart);
-        formData.append("rate", playbackRate);
-        formData.append("target_lang", state.targetLang);
-        if (state.langHint) formData.append("lang_hint", state.langHint);
+    if (typeof MediaRecorder === "undefined") return;
 
-        const res = await fetch(`${BACKEND_HTTP}/api/transcribe`, {
-          method: "POST",
-          body: formData,
-        });
+    let mimeType = "audio/webm;codecs=opus";
+    if (!MediaRecorder.isTypeSupported(mimeType)) {
+      mimeType = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "";
 
-        if (res.ok) {
-          const cue = await res.json();
-          showSubtitle(cue.translation, cue.text);
-          recordSubtitle(cue.translation, cue.text, cue.start, cue.end);
+    try {
+      isRecordingAudioSlice = true;
+      const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+      const recordedChunks = [];
+
+      recorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) {
+          recordedChunks.push(e.data);
         }
-      } catch (err) {
-        // Backend not reached
-      }
+      };
+
+      recorder.onstop = async () => {
+        isRecordingAudioSlice = false;
+        if (recordedChunks.length === 0) return;
+
+        const blob = new Blob(recordedChunks, { type: mimeType || "audio/webm" });
+        if (blob.size < 800) return; // Skip silence / empty header
+
+        const arrayBuffer = await blob.arrayBuffer();
+
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify(config));
+          ws.send(arrayBuffer);
+        } else {
+          // Fallback: POST /api/transcribe
+          try {
+            const formData = new FormData();
+            formData.append("audio", blob, "chunk.webm");
+            formData.append("chunk_start", chunkStart);
+            formData.append("rate", playbackRate);
+            formData.append("target_lang", state.targetLang);
+            if (state.langHint) formData.append("lang_hint", state.langHint);
+
+            const res = await fetch(`${BACKEND_HTTP}/api/transcribe`, {
+              method: "POST",
+              body: formData,
+            });
+            if (res.ok) {
+              const cue = await res.json();
+              if (cue && cue.translation && cue.translation.trim()) {
+                showSubtitle(cue.translation, cue.text);
+                recordSubtitle(cue.translation, cue.text, cue.start, cue.end);
+              }
+            }
+          } catch (err) {}
+        }
+      };
+
+      recorder.start();
+      // Record in 2.8 second slices for optimal speech detection
+      setTimeout(() => {
+        if (recorder.state === "recording") {
+          recorder.stop();
+        }
+      }, 2800);
+    } catch (err) {
+      isRecordingAudioSlice = false;
+      console.warn("[LiveSub] MediaRecorder recording error:", err);
     }
-  }, 2000); // 2-second chunks
+  }
+
+  recordAndSendSlice();
+  chunkInterval = setInterval(recordAndSendSlice, 3000);
 }
 
 function stopAudioStreaming() {
@@ -240,57 +331,101 @@ function stopAudioStreaming() {
 
 // ----------------------------------------------------------------------------
 // 4. Mode B: Translate Existing YouTube Captions
+// Non-blocking: every poll runs freely. requestId ensures only the
+// latest translation shows. Background pre-caches all visible segments.
 // ----------------------------------------------------------------------------
 let captionObserver = null;
+let captionPollInterval = null;
+const translationCache = new Map();
+let requestId = 0;
+
+async function translateDirect(text, targetLang) {
+  if (translationCache.has(text)) return translationCache.get(text);
+
+  const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${encodeURIComponent(targetLang)}&dt=t&q=${encodeURIComponent(text)}`;
+  const res = await fetch(url);
+  const data = await res.json();
+  const parts = (data[0] || []).map((s) => (s && s[0]) || "").join("");
+
+  if (parts) {
+    if (translationCache.size > 500) {
+      translationCache.delete(translationCache.keys().next().value);
+    }
+    translationCache.set(text, parts);
+    return parts;
+  }
+  return text;
+}
+
+// Pre-translate all visible caption segments in background (cache warming)
+function preCacheVisibleCaptions(targetLang) {
+  const allSegments = document.querySelectorAll(".ytp-caption-segment");
+  allSegments.forEach((el) => {
+    const t = el.innerText?.trim();
+    if (t && !translationCache.has(t)) {
+      translateDirect(t, targetLang).catch(() => {});
+    }
+  });
+}
 
 function startCaptionObserver() {
   stopCaptionObserver();
 
-  captionObserver = new MutationObserver(async () => {
+  captionPollInterval = setInterval(async () => {
     if (!state.enabled || state.subMode !== "caption_translate") return;
 
-    // Look for YouTube caption elements
-    const captionEl = document.querySelector(".ytp-caption-segment") ||
-                      document.querySelector(".caption-window");
+    const captionEl =
+      document.querySelector(".ytp-caption-segment") ||
+      document.querySelector(".ytp-caption-window-container .caption-visual-line") ||
+      document.querySelector(".caption-window span");
 
-    if (captionEl && captionEl.innerText.trim()) {
-      const rawText = captionEl.innerText.trim();
-      if (rawText !== lastTranslatedText) {
-        lastTranslatedText = rawText;
-        try {
-          const res = await fetch(`${BACKEND_HTTP}/api/translate`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              text: rawText,
-              src: state.langHint || "auto",
-              target: state.targetLang,
-            }),
-          });
+    if (!captionEl) return;
 
-          if (res.ok) {
-            const data = await res.json();
-            showSubtitle(data.translation, rawText);
-            recordSubtitle(data.translation, rawText, videoElement?.currentTime, (videoElement?.currentTime || 0) + 2.5);
-          }
-        } catch (e) {
-          console.warn("[LiveSub] Translation error:", e);
-        }
+    const rawText = captionEl.innerText?.trim();
+    if (!rawText || rawText === lastTranslatedText) return;
+
+    lastTranslatedText = rawText;
+    const myRequestId = ++requestId;
+
+    // Pre-cache other visible segments in background
+    preCacheVisibleCaptions(state.targetLang);
+
+    // INSTANT: cache hit
+    if (translationCache.has(rawText)) {
+      if (myRequestId === requestId) {
+        const translation = translationCache.get(rawText);
+        showSubtitle(translation, rawText);
+        recordSubtitle(translation, rawText, videoElement?.currentTime, (videoElement?.currentTime || 0) + 2.5);
       }
+      return;
     }
-  });
 
-  const player = document.querySelector("#movie_player") || document.body;
-  if (player) {
-    captionObserver.observe(player, { childList: true, subtree: true, characterData: true });
-  }
+    // Show original text while Hindi/other translation loads
+    showSubtitle(rawText, "");
+
+    try {
+      const translation = await translateDirect(rawText, state.targetLang);
+      // Only display if still the latest request (not stale)
+      if (myRequestId === requestId) {
+        showSubtitle(translation, rawText);
+        recordSubtitle(translation, rawText, videoElement?.currentTime, (videoElement?.currentTime || 0) + 2.5);
+      }
+    } catch (e) {
+      // Silently ignore — next poll will retry
+    }
+  }, 200);
 }
 
 function stopCaptionObserver() {
+  if (captionPollInterval) {
+    clearInterval(captionPollInterval);
+    captionPollInterval = null;
+  }
   if (captionObserver) {
     captionObserver.disconnect();
     captionObserver = null;
   }
+  requestId = 0;
 }
 
 // ----------------------------------------------------------------------------
@@ -343,6 +478,22 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       title: document.title.replace(/\s*-\s*YouTube$/, "").trim() || "LiveSub subtitles",
     });
     return;
+  }
+
+  if (request.action === "SHOW_CUE" && request.cue) {
+    const cue = request.cue;
+    if (cue.translation && cue.translation.trim() && cue.translation !== "[stub transcript]") {
+      showSubtitle(cue.translation, cue.text);
+      recordSubtitle(cue.translation, cue.text, cue.start, cue.end);
+
+      if (currentCueTimeout) clearTimeout(currentCueTimeout);
+      const durationSec = Math.max(2.0, (cue.end - cue.start) / (videoElement?.playbackRate || 1.0));
+      currentCueTimeout = setTimeout(() => {
+        hideSubtitle();
+      }, durationSec * 1000);
+    }
+    sendResponse({ status: "ok" });
+    return true;
   }
 
   if (request.action === "SETTINGS_CHANGED") {
