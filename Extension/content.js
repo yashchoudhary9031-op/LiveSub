@@ -147,13 +147,15 @@ function connectWebSocket() {
 
 let audioCaptureStream = null;
 
-function getAudioStream() {
+async function getAudioStream() {
   if (!videoElement) return null;
-  if (!audioCaptureStream) {
+
+  // 1. Try HTML5 video.captureStream()
+  if (!audioCaptureStream || !audioCaptureStream.active) {
     try {
-      const stream = videoElement.captureStream ? videoElement.captureStream() : videoElement.mozCaptureStream();
-      if (stream) {
-        const audioTracks = stream.getAudioTracks();
+      const vStream = videoElement.captureStream ? videoElement.captureStream() : (videoElement.mozCaptureStream ? videoElement.mozCaptureStream() : null);
+      if (vStream) {
+        const audioTracks = vStream.getAudioTracks();
         if (audioTracks && audioTracks.length > 0) {
           audioCaptureStream = new MediaStream(audioTracks);
         }
@@ -162,8 +164,38 @@ function getAudioStream() {
       console.warn("[LiveSub] captureStream unavailable:", e);
     }
   }
+
+  // 2. Fallback to tabCapture stream if available
+  if (!audioCaptureStream || !audioCaptureStream.active) {
+    try {
+      const response = await chrome.runtime.sendMessage({ action: "GET_TAB_STREAM_ID" });
+      if (response && response.streamId) {
+        const tabStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            mandatory: {
+              chromeMediaSource: "tab",
+              chromeMediaSourceId: response.streamId,
+            },
+          },
+          video: false,
+        });
+        if (tabStream && tabStream.getAudioTracks().length > 0) {
+          // Keep audio playing through user speakers
+          const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+          const source = audioCtx.createMediaStreamSource(tabStream);
+          source.connect(audioCtx.destination);
+          audioCaptureStream = tabStream;
+        }
+      }
+    } catch (err) {
+      console.warn("[LiveSub] tabCapture fallback:", err);
+    }
+  }
+
   return audioCaptureStream;
 }
+
+let isRecordingAudioSlice = false;
 
 function startAudioStreaming() {
   connectWebSocket();
@@ -171,9 +203,12 @@ function startAudioStreaming() {
   if (chunkInterval) clearInterval(chunkInterval);
 
   async function recordAndSendSlice() {
-    if (!state.enabled || !videoElement || videoElement.paused) return;
+    if (!state.enabled || state.subMode !== "audio_stt" || !videoElement || videoElement.paused) return;
+    if (isRecordingAudioSlice) return;
 
-    const stream = getAudioStream();
+    const stream = await getAudioStream();
+    if (!stream || !stream.active) return;
+
     const chunkStart = videoElement.currentTime;
     const playbackRate = videoElement.playbackRate || 1.0;
 
@@ -184,68 +219,75 @@ function startAudioStreaming() {
       lang_hint: state.langHint || null,
     };
 
-    if (stream && typeof MediaRecorder !== "undefined") {
-      let mimeType = "audio/webm";
-      if (!MediaRecorder.isTypeSupported("audio/webm")) {
-        mimeType = "";
-      }
+    if (typeof MediaRecorder === "undefined") return;
 
-      try {
-        const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
-        const recordedChunks = [];
+    let mimeType = "audio/webm;codecs=opus";
+    if (!MediaRecorder.isTypeSupported(mimeType)) {
+      mimeType = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "";
+    }
 
-        recorder.ondataavailable = (e) => {
-          if (e.data && e.data.size > 0) {
-            recordedChunks.push(e.data);
-          }
-        };
+    try {
+      isRecordingAudioSlice = true;
+      const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+      const recordedChunks = [];
 
-        recorder.onstop = async () => {
-          if (recordedChunks.length === 0) return;
-          const blob = new Blob(recordedChunks, { type: "audio/webm" });
-          const arrayBuffer = await blob.arrayBuffer();
+      recorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) {
+          recordedChunks.push(e.data);
+        }
+      };
 
-          if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify(config));
-            ws.send(arrayBuffer);
-          } else {
-            // Fallback HTTP
-            try {
-              const formData = new FormData();
-              formData.append("audio", blob, "chunk.webm");
-              formData.append("chunk_start", chunkStart);
-              formData.append("rate", playbackRate);
-              formData.append("target_lang", state.targetLang);
-              if (state.langHint) formData.append("lang_hint", state.langHint);
+      recorder.onstop = async () => {
+        isRecordingAudioSlice = false;
+        if (recordedChunks.length === 0) return;
 
-              const res = await fetch(`${BACKEND_HTTP}/api/transcribe`, {
-                method: "POST",
-                body: formData,
-              });
-              if (res.ok) {
-                const cue = await res.json();
-                if (cue.translation) {
-                  showSubtitle(cue.translation, cue.text);
-                }
+        const blob = new Blob(recordedChunks, { type: mimeType || "audio/webm" });
+        if (blob.size < 800) return; // Skip silence / empty header
+
+        const arrayBuffer = await blob.arrayBuffer();
+
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify(config));
+          ws.send(arrayBuffer);
+        } else {
+          // Fallback: POST /api/transcribe
+          try {
+            const formData = new FormData();
+            formData.append("audio", blob, "chunk.webm");
+            formData.append("chunk_start", chunkStart);
+            formData.append("rate", playbackRate);
+            formData.append("target_lang", state.targetLang);
+            if (state.langHint) formData.append("lang_hint", state.langHint);
+
+            const res = await fetch(`${BACKEND_HTTP}/api/transcribe`, {
+              method: "POST",
+              body: formData,
+            });
+            if (res.ok) {
+              const cue = await res.json();
+              if (cue && cue.translation && cue.translation.trim()) {
+                showSubtitle(cue.translation, cue.text);
               }
-            } catch (err) {}
-          }
-        };
+            }
+          } catch (err) {}
+        }
+      };
 
-        recorder.start();
-        setTimeout(() => {
-          if (recorder.state === "recording") {
-            recorder.stop();
-          }
-        }, 2200);
-      } catch (err) {
-        console.warn("[LiveSub] MediaRecorder recording error:", err);
-      }
+      recorder.start();
+      // Record in 2.8 second slices for optimal speech detection
+      setTimeout(() => {
+        if (recorder.state === "recording") {
+          recorder.stop();
+        }
+      }, 2800);
+    } catch (err) {
+      isRecordingAudioSlice = false;
+      console.warn("[LiveSub] MediaRecorder recording error:", err);
     }
   }
 
   recordAndSendSlice();
-  chunkInterval = setInterval(recordAndSendSlice, 2500);
+  chunkInterval = setInterval(recordAndSendSlice, 3000);
 }
 
 function stopAudioStreaming() {
