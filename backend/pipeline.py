@@ -1,0 +1,132 @@
+"""
+pipeline.py - Core processing pipeline for LiveSub.
+
+Handles speech-to-text transcription, translation, and cue assembly.
+Providers are selected via environment variables (STT_PROVIDER, TRANSLATE_PROVIDER),
+allowing easy swapping of local models (e.g. faster-whisper) or cloud APIs
+(e.g. Deepgram, OpenAI, DeepL) without altering application routes.
+"""
+
+import os
+from typing import Optional, Dict, Any
+
+try:
+    from timing import to_video_time
+except ImportError:
+    from .timing import to_video_time
+
+
+def get_stt_provider() -> str:
+    """Retrieve configured STT provider from environment (default: 'stub')."""
+    return os.getenv("STT_PROVIDER", "stub").lower()
+
+
+def get_translate_provider() -> str:
+    """Retrieve configured translation provider from environment (default: 'stub')."""
+    return os.getenv("TRANSLATE_PROVIDER", "stub").lower()
+
+
+# ============================================================================
+# STT IMPLEMENTATIONS
+# ============================================================================
+
+def _transcribe_stub(audio_bytes: bytes, lang_hint: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Placeholder STT implementation returning mock transcription.
+    
+    TODO: Replace or extend this with real speech-to-text:
+          - faster-whisper (local offline model)
+          - Hosted STT API (e.g., Deepgram, OpenAI Whisper, Groq, WhisperX)
+    """
+    return {
+        "text": "[stub transcript]",
+        "lang": lang_hint or "hi",
+        "duration": 2.0,
+    }
+
+
+def transcribe(audio_bytes: bytes, lang_hint: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Transcribe raw audio bytes into text, language, and duration.
+    Dispatches to the provider designated by STT_PROVIDER.
+    """
+    provider = get_stt_provider()
+
+    if provider == "stub":
+        return _transcribe_stub(audio_bytes, lang_hint=lang_hint)
+    else:
+        # TODO: Add handlers for "whisper", "deepgram", etc.
+        raise NotImplementedError(f"STT provider '{provider}' is not implemented yet.")
+
+
+# ============================================================================
+# TRANSLATION IMPLEMENTATIONS
+# ============================================================================
+
+def _translate_stub(text: str, src: str, target: str) -> str:
+    """
+    Placeholder translation implementation.
+    Returns text unchanged if source language equals target language,
+    otherwise prepends target tag: f"[{target}] {text}".
+
+    TODO: Replace or extend this with real translation:
+          - Hosted API (e.g., DeepL, Google Cloud Translate, LibreTranslate)
+          - Local model (e.g., MarianMT, NLLB-200, SeamlessM4T)
+    """
+    if src == target:
+        return text
+    return f"[{target}] {text}"
+
+
+def translate(text: str, src: str, target: str) -> str:
+    """
+    Translate text from src language to target language.
+    Dispatches to the provider designated by TRANSLATE_PROVIDER.
+    """
+    provider = get_translate_provider()
+
+    if provider == "stub":
+        return _translate_stub(text, src, target)
+    else:
+        # TODO: Add handlers for "deepl", "google", etc.
+        raise NotImplementedError(f"Translate provider '{provider}' is not implemented yet.")
+
+
+# ============================================================================
+# PIPELINE CUE ASSEMBLY
+# ============================================================================
+
+def build_cue(
+    audio_bytes: bytes,
+    chunk_start: float,
+    rate: float = 1.0,
+    target_lang: str = "en",
+    lang_hint: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Process an audio chunk and construct a synchronized subtitle cue.
+
+    1. Transcribe the audio chunk (recovering text, detected language, and chunk duration).
+    2. Translate the transcript into target_lang.
+    3. Compute video timeline start and end timestamps using to_video_time().
+    4. Return cue dictionary conforming to Cue schema.
+    """
+    stt_res = transcribe(audio_bytes, lang_hint=lang_hint)
+    original_text = stt_res.get("text", "")
+    detected_lang = stt_res.get("lang", lang_hint or "hi")
+    audio_duration = float(stt_res.get("duration", 2.0))
+
+    translated_text = translate(original_text, src=detected_lang, target=target_lang)
+
+    # Convert audio offsets to video timeline seconds
+    start_time = to_video_time(chunk_start, 0.0, rate)
+    end_time = to_video_time(chunk_start, audio_duration, rate)
+
+    return {
+        "start": start_time,
+        "end": end_time,
+        "lang": detected_lang,
+        "text": original_text,
+        "translation": translated_text,
+        "source": "stt",
+    }
