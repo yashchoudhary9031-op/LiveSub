@@ -19,6 +19,7 @@ let mediaRecorder = null;
 let chunkInterval = null;
 let currentCueTimeout = null;
 let lastTranslatedText = "";
+let subtitleHistory = [];
 
 // ----------------------------------------------------------------------------
 // 1. Initialize & Inject Overlay
@@ -44,14 +45,34 @@ function initOverlay() {
 function showSubtitle(translation, original = null) {
   if (!captionBox || !overlayContainer) return;
 
-  let html = `<div class="livesub-translation">${escapeHtml(translation)}</div>`;
+  let html = "";
   if (original && original !== translation) {
     html += `<div class="livesub-original">${escapeHtml(original)}</div>`;
   }
+  html += `<div class="livesub-translation">${escapeHtml(translation)}</div>`;
 
   captionBox.innerHTML = html;
   captionBox.style.fontSize = state.fontSize;
   overlayContainer.classList.remove("hidden");
+}
+
+function recordSubtitle(translation, original, start, end) {
+  if (!translation) return;
+
+  const cueStart = Number.isFinite(Number(start)) ? Number(start) : (videoElement?.currentTime || 0);
+  const cueEnd = Number.isFinite(Number(end)) && Number(end) > cueStart
+    ? Number(end)
+    : cueStart + 2.5;
+  const cue = {
+    start: cueStart,
+    end: cueEnd,
+    original: original || "",
+    translation,
+  };
+  const previous = subtitleHistory[subtitleHistory.length - 1];
+
+  if (previous && previous.start === cue.start && previous.translation === cue.translation) return;
+  subtitleHistory.push(cue);
 }
 
 function hideSubtitle() {
@@ -101,13 +122,14 @@ function connectWebSocket() {
   }
 
   try {
-    ws = new WebSocket(BACKEND_WS);
+    const socket = new WebSocket(BACKEND_WS);
+    ws = socket;
 
-    ws.onopen = () => {
+    socket.onopen = () => {
       console.log("[LiveSub] WebSocket connected to backend");
     };
 
-    ws.onmessage = (event) => {
+    socket.onmessage = (event) => {
       try {
         const cue = JSON.parse(event.data);
         if (cue.error) {
@@ -118,6 +140,7 @@ function connectWebSocket() {
         // Display cue with synchronization
         if (cue.translation) {
           showSubtitle(cue.translation, cue.text);
+          recordSubtitle(cue.translation, cue.text, cue.start, cue.end);
 
           // Clear previous timeout and schedule hide after duration
           if (currentCueTimeout) clearTimeout(currentCueTimeout);
@@ -131,14 +154,14 @@ function connectWebSocket() {
       }
     };
 
-    ws.onclose = () => {
-      console.log("[LiveSub] WebSocket disconnected");
-      ws = null;
+    socket.onclose = (event) => {
+      console.log(`[LiveSub] WebSocket disconnected (code ${event.code}${event.reason ? `: ${event.reason}` : ""})`);
+      if (ws === socket) ws = null;
     };
 
-    ws.onerror = (err) => {
-      console.warn("[LiveSub] WebSocket error, will retry on next chunk:", err);
-      ws = null;
+    socket.onerror = () => {
+      console.warn(`[LiveSub] WebSocket connection failed at ${BACKEND_WS}; will retry on next chunk`);
+      if (ws === socket) ws = null;
     };
   } catch (err) {
     console.error("[LiveSub] Could not open WebSocket:", err);
@@ -203,7 +226,10 @@ function startAudioStreaming() {
   if (chunkInterval) clearInterval(chunkInterval);
 
   async function recordAndSendSlice() {
-    if (!state.enabled || state.subMode !== "audio_stt" || !videoElement || videoElement.paused) return;
+    if (!state.enabled || !videoElement || videoElement.paused) return;
+    if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+      connectWebSocket();
+    }
     if (isRecordingAudioSlice) return;
 
     const stream = await getAudioStream();
@@ -224,7 +250,6 @@ function startAudioStreaming() {
     let mimeType = "audio/webm;codecs=opus";
     if (!MediaRecorder.isTypeSupported(mimeType)) {
       mimeType = MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "";
-    }
 
     try {
       isRecordingAudioSlice = true;
@@ -267,6 +292,7 @@ function startAudioStreaming() {
               const cue = await res.json();
               if (cue && cue.translation && cue.translation.trim()) {
                 showSubtitle(cue.translation, cue.text);
+                recordSubtitle(cue.translation, cue.text, cue.start, cue.end);
               }
             }
           } catch (err) {}
@@ -367,7 +393,9 @@ function startCaptionObserver() {
     // INSTANT: cache hit
     if (translationCache.has(rawText)) {
       if (myRequestId === requestId) {
-        showSubtitle(translationCache.get(rawText), rawText);
+        const translation = translationCache.get(rawText);
+        showSubtitle(translation, rawText);
+        recordSubtitle(translation, rawText, videoElement?.currentTime, (videoElement?.currentTime || 0) + 2.5);
       }
       return;
     }
@@ -380,6 +408,7 @@ function startCaptionObserver() {
       // Only display if still the latest request (not stale)
       if (myRequestId === requestId) {
         showSubtitle(translation, rawText);
+        recordSubtitle(translation, rawText, videoElement?.currentTime, (videoElement?.currentTime || 0) + 2.5);
       }
     } catch (e) {
       // Silently ignore — next poll will retry
@@ -443,10 +472,19 @@ chrome.storage.local.get(
 );
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.action === "EXPORT_SUBTITLES") {
+    sendResponse({
+      subtitles: subtitleHistory,
+      title: document.title.replace(/\s*-\s*YouTube$/, "").trim() || "LiveSub subtitles",
+    });
+    return;
+  }
+
   if (request.action === "SHOW_CUE" && request.cue) {
     const cue = request.cue;
     if (cue.translation && cue.translation.trim() && cue.translation !== "[stub transcript]") {
       showSubtitle(cue.translation, cue.text);
+      recordSubtitle(cue.translation, cue.text, cue.start, cue.end);
 
       if (currentCueTimeout) clearTimeout(currentCueTimeout);
       const durationSec = Math.max(2.0, (cue.end - cue.start) / (videoElement?.playbackRate || 1.0));
@@ -475,6 +513,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
 // Re-hook on YouTube SPA navigation
 window.addEventListener("yt-navigate-finish", () => {
+  subtitleHistory = [];
+  lastTranslatedText = "";
   initOverlay();
   bindVideo();
   if (state.enabled && videoElement && !videoElement.paused) {
