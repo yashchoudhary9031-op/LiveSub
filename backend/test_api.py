@@ -106,7 +106,7 @@ def test_get_health():
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "ok"
-    assert data["stt_provider"] in ["stub", "whisper"]
+    assert data["stt_provider"] in ["stub", "whisper", "groq"]
     assert data["translate_provider"] in ["stub", "google"]
 
 

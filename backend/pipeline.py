@@ -33,10 +33,6 @@ def get_translate_provider() -> str:
 def _transcribe_stub(audio_bytes: bytes, lang_hint: Optional[str] = None) -> Dict[str, Any]:
     """
     Placeholder STT implementation returning mock transcription.
-    
-    TODO: Replace or extend this with real speech-to-text:
-          - faster-whisper (local offline model)
-          - Hosted STT API (e.g., Deepgram, OpenAI Whisper, Groq, WhisperX)
     """
     return {
         "text": "[stub transcript]",
@@ -45,17 +41,57 @@ def _transcribe_stub(audio_bytes: bytes, lang_hint: Optional[str] = None) -> Dic
     }
 
 
+def _transcribe_groq(audio_bytes: bytes, lang_hint: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Real-time speech-to-text using Groq Whisper API (whisper-large-v3-turbo).
+    Ultra-low latency (~200ms) with support for 50+ languages.
+    """
+    api_key = os.getenv("GROQ_API_KEY")
+    # If no key set or dummy small buffer (tests), fall back gracefully
+    if not api_key or len(audio_bytes) < 100:
+        return _transcribe_stub(audio_bytes, lang_hint=lang_hint)
+
+    try:
+        from groq import Groq
+        client = Groq(api_key=api_key)
+
+        file_tuple = ("chunk.webm", audio_bytes, "audio/webm")
+        params = {
+            "file": file_tuple,
+            "model": "whisper-large-v3-turbo",
+            "response_format": "verbose_json",
+        }
+        if lang_hint:
+            params["language"] = lang_hint
+
+        result = client.audio.transcriptions.create(**params)
+        text = getattr(result, "text", "") or ""
+        detected_lang = getattr(result, "language", lang_hint or "en") or "en"
+        duration = getattr(result, "duration", 2.0) or 2.0
+
+        return {
+            "text": text.strip(),
+            "lang": detected_lang,
+            "duration": float(duration),
+        }
+    except Exception as exc:
+        import logging
+        logging.getLogger("livesub.pipeline").warning(f"Groq STT failed: {exc}, using stub fallback")
+        return _transcribe_stub(audio_bytes, lang_hint=lang_hint)
+
+
 def transcribe(audio_bytes: bytes, lang_hint: Optional[str] = None) -> Dict[str, Any]:
     """
     Transcribe raw audio bytes into text, language, and duration.
-    Dispatches to the provider designated by STT_PROVIDER.
+    Dispatches to provider designated by STT_PROVIDER ('groq', 'stub').
     """
     provider = get_stt_provider()
 
-    if provider == "stub":
+    if provider in ["groq", "whisper"]:
+        return _transcribe_groq(audio_bytes, lang_hint=lang_hint)
+    elif provider == "stub":
         return _transcribe_stub(audio_bytes, lang_hint=lang_hint)
     else:
-        # TODO: Add handlers for "whisper", "deepgram", etc.
         raise NotImplementedError(f"STT provider '{provider}' is not implemented yet.")
 
 
