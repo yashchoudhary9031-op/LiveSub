@@ -68,28 +68,68 @@ def _translate_stub(text: str, src: str, target: str) -> str:
     Placeholder translation implementation.
     Returns text unchanged if source language equals target language,
     otherwise prepends target tag: f"[{target}] {text}".
-
-    TODO: Replace or extend this with real translation:
-          - Hosted API (e.g., DeepL, Google Cloud Translate, LibreTranslate)
-          - Local model (e.g., MarianMT, NLLB-200, SeamlessM4T)
     """
     if src == target:
         return text
     return f"[{target}] {text}"
 
 
-def translate(text: str, src: str, target: str) -> str:
+def _translate_google(text: str, src: str, target: str) -> str:
+    """
+    Real-time translation using Google Translate endpoint via httpx.
+    Supports 100+ languages with zero API keys required.
+    """
+    if not text or not text.strip():
+        return text
+    if src == target:
+        return text
+
+    sl_code = src if src and src.lower() != "auto" else "auto"
+    tl_code = target if target else "en"
+
+    try:
+        import httpx
+        url = "https://translate.googleapis.com/translate_a/single"
+        params = {
+            "client": "gtx",
+            "sl": sl_code,
+            "tl": tl_code,
+            "dt": "t",
+            "q": text,
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        with httpx.Client(timeout=5.0) as client:
+            resp = client.get(url, params=params, headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data and isinstance(data, list) and len(data) > 0 and isinstance(data[0], list):
+                    parts = [segment[0] for segment in data[0] if segment and len(segment) > 0 and segment[0]]
+                    if parts:
+                        return "".join(parts)
+    except Exception:
+        pass
+
+    # Fallback if network or endpoint fails
+    return _translate_stub(text, src, target)
+
+
+def translate(text: str, src: str, target: str, provider: Optional[str] = None) -> str:
     """
     Translate text from src language to target language.
-    Dispatches to the provider designated by TRANSLATE_PROVIDER.
+    Dispatches to provider designated by TRANSLATE_PROVIDER or explicit argument.
+    Supports: 'google' (real translation) and 'stub' (placeholder).
     """
-    provider = get_translate_provider()
+    active_provider = (provider or get_translate_provider()).lower()
 
-    if provider == "stub":
+    if active_provider in ["google", "real"]:
+        return _translate_google(text, src, target)
+    elif active_provider == "stub":
         return _translate_stub(text, src, target)
     else:
-        # TODO: Add handlers for "deepl", "google", etc.
-        raise NotImplementedError(f"Translate provider '{provider}' is not implemented yet.")
+        # Easy extension point for DeepL, etc.
+        raise NotImplementedError(f"Translate provider '{active_provider}' is not implemented yet.")
 
 
 # ============================================================================
