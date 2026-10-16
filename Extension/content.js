@@ -443,6 +443,21 @@ chrome.storage.local.get(
 );
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.action === "SHOW_CUE" && request.cue) {
+    const cue = request.cue;
+    if (cue.translation && cue.translation.trim() && cue.translation !== "[stub transcript]") {
+      showSubtitle(cue.translation, cue.text);
+
+      if (currentCueTimeout) clearTimeout(currentCueTimeout);
+      const durationSec = Math.max(2.0, (cue.end - cue.start) / (videoElement?.playbackRate || 1.0));
+      currentCueTimeout = setTimeout(() => {
+        hideSubtitle();
+      }, durationSec * 1000);
+    }
+    sendResponse({ status: "ok" });
+    return true;
+  }
+
   if (request.action === "SETTINGS_CHANGED") {
     state = request.settings;
     if (captionBox) {

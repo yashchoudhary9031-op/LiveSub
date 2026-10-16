@@ -7,7 +7,8 @@
     "storage",
     "activeTab",
     "scripting",
-    "tabCapture"
+    "tabCapture",
+    "offscreen"
   ],
   "host_permissions": [
     "*://*.youtube.com/*",
