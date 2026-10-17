@@ -2,20 +2,18 @@
 
 const BACKEND_WS = "ws://localhost:8000/ws";
 const BACKEND_HTTP = "http://localhost:8000";
-const CHUNK_DURATION_MS = 1500; // 1.5s slice: optimal for Whisper large-v3-turbo low latency
+const CHUNK_DURATION_MS = 1500; // 1.5s slice: optimal for Whisper large-v3-turbo
 
 let mediaStream = null;
 let audioContext = null;
-let analyser = null;
-let audioDataArray = null;
 let ws = null;
 let isRecording = false;
-let isPaused = false;
 let currentTabId = null;
 let currentTargetLang = "hi";
 let currentLangHint = "";
 let chunkTimer = null;
 let activeRecorder = null;
+let wsPingInterval = null;
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === "START_TAB_CAPTURE") {
@@ -27,16 +25,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   } else if (message.action === "UPDATE_CONFIG") {
     if (message.targetLang) currentTargetLang = message.targetLang;
     if (message.langHint !== undefined) currentLangHint = message.langHint;
-    console.log("[LiveSub Offscreen] Config updated:", { currentTargetLang, currentLangHint });
+    if (message.targetTabId) currentTabId = message.targetTabId;
+    console.log("[LiveSub Offscreen] Config updated:", { currentTargetLang, currentLangHint, currentTabId });
     sendResponse({ status: "updated" });
-  } else if (message.action === "VIDEO_STATUS") {
-    isPaused = !!message.paused;
-    console.log("[LiveSub Offscreen] Video playback status:", isPaused ? "PAUSED" : "PLAYING");
-    sendResponse({ status: "ok" });
   }
 });
-
-let wsPingInterval = null;
 
 function initWebSocket() {
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
@@ -48,7 +41,6 @@ function initWebSocket() {
 
     ws.onopen = () => {
       console.log("[LiveSub Offscreen] WebSocket connected to backend");
-      // Keepalive ping every 15s — prevents silent connection drops
       if (wsPingInterval) clearInterval(wsPingInterval);
       wsPingInterval = setInterval(() => {
         if (ws && ws.readyState === WebSocket.OPEN) {
@@ -60,12 +52,8 @@ function initWebSocket() {
     ws.onmessage = (event) => {
       try {
         const cue = JSON.parse(event.data);
-        if (cue && cue.translation && cue.translation.trim() && cue.translation !== "[stub transcript]" && currentTabId) {
-          // Forward subtitle cue to the active YouTube tab
-          chrome.tabs.sendMessage(currentTabId, {
-            action: "SHOW_CUE",
-            cue: cue,
-          }).catch(() => {});
+        if (cue && cue.translation && cue.translation.trim() && cue.translation !== "[stub transcript]") {
+          deliverCueToTabs(cue);
         }
       } catch (e) {
         console.warn("[LiveSub Offscreen] Error parsing cue:", e);
@@ -79,14 +67,34 @@ function initWebSocket() {
 
     ws.onclose = () => {
       ws = null;
-      // Fast auto-reconnect — 300ms not 2000ms so audio flow resumes instantly
+      if (wsPingInterval) clearInterval(wsPingInterval);
       if (isRecording) {
-        setTimeout(initWebSocket, 300);
+        setTimeout(initWebSocket, 500);
       }
     };
   } catch (err) {
     console.error("[LiveSub Offscreen] WebSocket init failed:", err);
   }
+}
+
+function deliverCueToTabs(cue) {
+  // 1. Direct message to target tab
+  if (currentTabId) {
+    chrome.tabs.sendMessage(currentTabId, { action: "SHOW_CUE", cue }).catch(() => {});
+  }
+
+  // 2. Fallback to active YouTube tabs in case targetTabId changed
+  try {
+    chrome.tabs.query({ url: "*://*.youtube.com/*" }, (tabs) => {
+      if (tabs && tabs.length > 0) {
+        tabs.forEach((t) => {
+          if (t.id && t.id !== currentTabId) {
+            chrome.tabs.sendMessage(t.id, { action: "SHOW_CUE", cue }).catch(() => {});
+          }
+        });
+      }
+    });
+  } catch (e) {}
 }
 
 async function startCapture(config) {
@@ -95,12 +103,11 @@ async function startCapture(config) {
   currentTabId = config.targetTabId;
   currentTargetLang = config.targetLang || "hi";
   currentLangHint = config.langHint || "";
-  isPaused = false;
 
   initWebSocket();
 
   try {
-    // 1. Capture real audio stream from the tab
+    // 1. Capture real audio stream from tab
     mediaStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         mandatory: {
@@ -111,46 +118,31 @@ async function startCapture(config) {
       video: false,
     });
 
-    // 2. Keep audio playing through user's speakers/headphones
+    // Handle stream closure (e.g. user reloads tab)
+    mediaStream.getAudioTracks().forEach((track) => {
+      track.onended = () => {
+        console.log("[LiveSub Offscreen] Audio track ended");
+        stopCapture();
+      };
+    });
+
+    // 2. Play audio back through user speakers
     audioContext = new (window.AudioContext || window.webkitAudioContext)();
     const source = audioContext.createMediaStreamSource(mediaStream);
     source.connect(audioContext.destination);
 
-    // 3. Attach real-time audio volume analyser (Voice Activity Check)
-    analyser = audioContext.createAnalyser();
-    analyser.fftSize = 256;
-    audioDataArray = new Uint8Array(analyser.frequencyBinCount);
-    source.connect(analyser);
-
-    // 4. Start gapless continuous audio slicing
+    // 3. Start gapless audio slicing
     isRecording = true;
     recordNextSlice();
 
-    console.log("[LiveSub Offscreen] Tab audio capture successfully active with 1.5s gapless slices");
+    console.log("[LiveSub Offscreen] Tab audio capture active. Streaming 1.5s slices to backend.");
   } catch (err) {
     console.error("[LiveSub Offscreen] Failed to start tab audio capture:", err);
   }
 }
 
-function getAudioRms() {
-  if (!analyser || !audioDataArray) return 1.0;
-  analyser.getByteTimeDomainData(audioDataArray);
-  let sum = 0;
-  for (let i = 0; i < audioDataArray.length; i++) {
-    const val = (audioDataArray[i] - 128) / 128.0;
-    sum += val * val;
-  }
-  return Math.sqrt(sum / audioDataArray.length);
-}
-
 function recordNextSlice() {
   if (!isRecording || !mediaStream || !mediaStream.active) return;
-
-  if (isPaused) {
-    // If user paused YouTube video, check again in 300ms without wasting CPU
-    chunkTimer = setTimeout(recordNextSlice, 300);
-    return;
-  }
 
   let mimeType = "audio/webm;codecs=opus";
   if (!MediaRecorder.isTypeSupported(mimeType)) {
@@ -172,25 +164,18 @@ function recordNextSlice() {
       if (recordedChunks.length === 0) return;
       const blob = new Blob(recordedChunks, { type: mimeType || "audio/webm" });
 
-      // If audio chunk is too small or silence, skip sending to avoid Whisper hallucinations
+      // Skip empty or corrupted webm header (< 800 bytes)
       if (blob.size < 800) return;
-
-      const rms = getAudioRms();
-      if (rms < 0.003) {
-        // Pure silence (e.g. video quiet pause)
-        return;
-      }
 
       sendAudioSlice(blob);
     };
 
     recorder.start();
 
-    // Gapless chaining: schedule next slice at exactly CHUNK_DURATION_MS
+    // Gapless chaining: schedule next recorder start at CHUNK_DURATION_MS
     chunkTimer = setTimeout(() => {
       if (isRecording) {
-        // Start next recorder immediately on the active stream (zero dead zone!)
-        recordNextSlice();
+        recordNextSlice(); // Seamlessly starts next chunk
       }
       if (recorder.state === "recording") {
         recorder.stop();
@@ -218,7 +203,7 @@ async function sendAudioSlice(blob) {
       ws.send(JSON.stringify(configPayload));
       ws.send(arrayBuffer);
     } else {
-      // Fallback: POST /api/transcribe
+      // Fallback: POST /api/transcribe HTTP
       const formData = new FormData();
       formData.append("audio", blob, "chunk.webm");
       formData.append("chunk_start", 0.0);
@@ -233,11 +218,8 @@ async function sendAudioSlice(blob) {
 
       if (res.ok) {
         const cue = await res.json();
-        if (cue && cue.translation && cue.translation.trim() && cue.translation !== "[stub transcript]" && currentTabId) {
-          chrome.tabs.sendMessage(currentTabId, {
-            action: "SHOW_CUE",
-            cue: cue,
-          }).catch(() => {});
+        if (cue && cue.translation && cue.translation.trim() && cue.translation !== "[stub transcript]") {
+          deliverCueToTabs(cue);
         }
       }
     }
@@ -271,8 +253,6 @@ function stopCapture() {
       audioContext.close();
     } catch (e) {}
     audioContext = null;
-    analyser = null;
-    audioDataArray = null;
   }
 
   if (ws) {
@@ -280,5 +260,10 @@ function stopCapture() {
       ws.close();
     } catch (e) {}
     ws = null;
+  }
+
+  if (wsPingInterval) {
+    clearInterval(wsPingInterval);
+    wsPingInterval = null;
   }
 }

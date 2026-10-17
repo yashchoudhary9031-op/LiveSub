@@ -92,14 +92,14 @@ function loadSettings() {
       enabled: false,
       targetLang: "hi",
       langHint: "",
-      subMode: "audio_stt",
+      subMode: "auto",
       fontSize: "22px",
     },
     (settings) => {
       elements.enabledToggle.checked = settings.enabled;
       elements.targetLang.value = settings.targetLang;
       elements.langHint.value = settings.langHint;
-      elements.subMode.value = settings.subMode;
+      elements.subMode.value = settings.subMode || "auto";
       elements.fontSize.value = settings.fontSize;
     }
   );
@@ -117,7 +117,7 @@ function saveSettings() {
 
   chrome.storage.local.set(settings, () => {
     // Notify background audio session
-    if (settings.enabled && settings.subMode === "audio_stt") {
+    if (settings.enabled && (settings.subMode === "audio_stt" || settings.subMode === "auto")) {
       chrome.runtime.sendMessage({ action: "START_AUDIO_SESSION", settings: settings }).catch(() => {});
     } else {
       chrome.runtime.sendMessage({ action: "STOP_AUDIO_SESSION" }).catch(() => {});

@@ -45,3 +45,10 @@
   color: #ffeb3b;
   font-size: 1.05em;
 }
+
+/* Hide native YouTube caption overlays when LiveSub is active to avoid collisions */
+body.livesub-active .ytp-caption-window-container,
+body.livesub-active .caption-window {
+  opacity: 0 !important;
+  visibility: hidden !important;
+}
