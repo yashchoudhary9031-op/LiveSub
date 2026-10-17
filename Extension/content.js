@@ -31,7 +31,7 @@ function initOverlay() {
     overlayContainer = existing;
     captionBox = overlayContainer.querySelector(".livesub-caption-box");
 
-    // If overlay was attached to body earlier, re-attach to movie_player so fullscreen works
+    // Move into movie_player if it was on body, so fullscreen shows it
     if (player && overlayContainer.parentElement !== player) {
       player.appendChild(overlayContainer);
     }
@@ -158,7 +158,8 @@ function startCaptionObserver() {
 
     if (!captionEl) return;
 
-    const rawText = captionEl.innerText?.trim();
+    // Use textContent so opacity: 0 does not block text extraction
+    const rawText = (captionEl.textContent || captionEl.innerText || "").trim();
     if (!rawText || rawText === lastTranslatedText) return;
 
     lastTranslatedText = rawText;
@@ -214,6 +215,12 @@ function startSubtitles() {
   console.log("[LiveSub] Starting subtitles in mode:", state.subMode);
 
   document.body.classList.add("livesub-active");
+
+  // Show a brief badge so user sees LiveSub is ON
+  showSubtitle("LiveSub Active 🟢", "");
+  setTimeout(() => {
+    if (lastTranslatedText === "") hideSubtitle();
+  }, 1200);
 
   if (state.subMode === "caption_translate") {
     // CC only

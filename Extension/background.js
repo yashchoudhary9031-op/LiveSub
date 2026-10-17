@@ -2,6 +2,7 @@
 
 let isCapturing = false;
 let capturedTabId = null;
+let isStartingSession = false;
 
 chrome.runtime.onInstalled.addListener(() => {
   console.log("[LiveSub] Extension installed successfully.");
@@ -9,7 +10,7 @@ chrome.runtime.onInstalled.addListener(() => {
     enabled: false,
     targetLang: "hi",
     langHint: "",
-    subMode: "audio_stt",
+    subMode: "auto",
     fontSize: "22px",
   });
 });
@@ -31,6 +32,9 @@ async function setupOffscreenDocument() {
 
 // Start tab audio capture session
 async function startSession(settings, preferredTab = null) {
+  if (isStartingSession) return;
+  isStartingSession = true;
+
   try {
     let activeTab = preferredTab;
     if (!activeTab || !activeTab.id) {
@@ -41,9 +45,6 @@ async function startSession(settings, preferredTab = null) {
     }
 
     if (!activeTab || !activeTab.id) return;
-
-    // Ensure tab is a YouTube tab or valid URL
-    if (activeTab.url && !activeTab.url.includes("youtube.com")) return;
 
     if (isCapturing && capturedTabId === activeTab.id) {
       // If already capturing for this tab, seamlessly update target language / hint
@@ -91,6 +92,8 @@ async function startSession(settings, preferredTab = null) {
     console.log("[LiveSub] Session started for tab", activeTab.id);
   } catch (err) {
     console.error("[LiveSub] startSession failed:", err);
+  } finally {
+    isStartingSession = false;
   }
 }
 
