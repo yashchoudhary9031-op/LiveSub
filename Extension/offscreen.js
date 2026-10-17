@@ -2,7 +2,7 @@
 
 const BACKEND_WS = "ws://localhost:8000/ws";
 const BACKEND_HTTP = "http://localhost:8000";
-const CHUNK_DURATION_MS = 1500; // 1.5s slice: optimal for Whisper large-v3-turbo
+const CHUNK_DURATION_MS = 1000; // 1.0s slice for lightning fast Whisper STT (<1.1s total turnaround)
 
 let mediaStream = null;
 let audioContext = null;

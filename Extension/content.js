@@ -123,14 +123,15 @@ function onSeeking() {
 }
 
 // ----------------------------------------------------------------------------
-// 3. YouTube Caption Translation Engine
+// 3. YouTube Caption Translation Engine (Ultra-Fast 35ms Polling + Pre-caching)
 // ----------------------------------------------------------------------------
 async function translateDirect(text, targetLang) {
   const cacheKey = `${targetLang}:${text}`;
   if (translationCache.has(cacheKey)) return translationCache.get(cacheKey);
 
   try {
-    const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${encodeURIComponent(targetLang)}&dt=t&q=${encodeURIComponent(text)}`;
+    const srcLang = state.langHint ? encodeURIComponent(state.langHint) : "auto";
+    const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${srcLang}&tl=${encodeURIComponent(targetLang)}&dt=t&q=${encodeURIComponent(text)}`;
     const res = await fetch(url);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
@@ -142,6 +143,19 @@ async function translateDirect(text, targetLang) {
     }
   } catch (e) {}
   return text;
+}
+
+function preCacheVisibleSegments() {
+  const segments = document.querySelectorAll(".ytp-caption-segment");
+  segments.forEach((seg) => {
+    const t = (seg.textContent || "").trim();
+    if (t && t.length > 1) {
+      const cacheKey = `${state.targetLang}:${t}`;
+      if (!translationCache.has(cacheKey)) {
+        translateDirect(t, state.targetLang).catch(() => {});
+      }
+    }
+  });
 }
 
 function startCaptionObserver() {
@@ -166,9 +180,11 @@ function startCaptionObserver() {
     lastCaptionTime = Date.now();
     const myRequestId = ++requestId;
 
+    preCacheVisibleSegments();
+
     const cacheKey = `${state.targetLang}:${rawText}`;
 
-    // Instant cache hit
+    // Instant cache hit (0ms delay!)
     if (translationCache.has(cacheKey)) {
       if (myRequestId === requestId) {
         const cached = translationCache.get(cacheKey);
@@ -188,7 +204,7 @@ function startCaptionObserver() {
         recordSubtitle(translation, rawText, videoElement?.currentTime, (videoElement?.currentTime || 0) + 2.5);
       }
     } catch (e) {}
-  }, 100);
+  }, 35);
 }
 
 function stopCaptionObserver() {
@@ -283,8 +299,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       recordSubtitle(cue.translation, cue.text, cue.start, cue.end);
 
       if (currentCueTimeout) clearTimeout(currentCueTimeout);
-      // Keep visible for 2.8s so sequential audio chunks overlap smoothly
-      currentCueTimeout = setTimeout(hideSubtitle, 2800);
+      // Keep visible for 2.2s so sequential 1.0s audio chunks overlap smoothly
+      currentCueTimeout = setTimeout(hideSubtitle, 2200);
     }
     sendResponse({ status: "ok" });
     return true;
