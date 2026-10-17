@@ -52,7 +52,8 @@ function initWebSocket() {
     ws.onmessage = (event) => {
       try {
         const cue = JSON.parse(event.data);
-        if (cue && cue.translation && cue.translation.trim() && cue.translation !== "[stub transcript]") {
+        const validText = (cue?.translation && cue.translation !== "[stub transcript]") || (cue?.text && cue.text !== "[stub transcript]");
+        if (cue && validText) {
           deliverCueToTabs(cue);
         }
       } catch (e) {
@@ -218,7 +219,8 @@ async function sendAudioSlice(blob) {
 
       if (res.ok) {
         const cue = await res.json();
-        if (cue && cue.translation && cue.translation.trim() && cue.translation !== "[stub transcript]") {
+        const validText = (cue?.translation && cue.translation !== "[stub transcript]") || (cue?.text && cue.text !== "[stub transcript]");
+        if (cue && validText) {
           deliverCueToTabs(cue);
         }
       }

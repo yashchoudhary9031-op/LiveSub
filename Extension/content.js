@@ -61,7 +61,7 @@ function showSubtitle(translation, original = null) {
   if (!captionBox || !overlayContainer) return;
 
   let html = `<div class="livesub-translation">${escapeHtml(translation)}</div>`;
-  if (original && original !== translation && original !== "[stub transcript]") {
+  if (original && original.trim() && original.trim() !== translation.trim() && original !== "[stub transcript]") {
     html += `<div class="livesub-original">${escapeHtml(original)}</div>`;
   }
 
@@ -294,9 +294,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       return true;
     }
 
-    if (cue.translation && cue.translation.trim() && cue.translation !== "[stub transcript]") {
-      showSubtitle(cue.translation, cue.text);
-      recordSubtitle(cue.translation, cue.text, cue.start, cue.end);
+    const displayText = (cue.translation && cue.translation.trim() && cue.translation !== "[stub transcript]")
+      ? cue.translation.trim()
+      : (cue.text && cue.text.trim() && cue.text !== "[stub transcript]" ? cue.text.trim() : "");
+
+    if (displayText) {
+      showSubtitle(displayText, cue.text);
+      recordSubtitle(displayText, cue.text, cue.start, cue.end);
 
       if (currentCueTimeout) clearTimeout(currentCueTimeout);
       // Keep visible for 2.2s so sequential 1.0s audio chunks overlap smoothly
