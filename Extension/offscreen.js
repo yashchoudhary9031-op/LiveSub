@@ -52,7 +52,13 @@ function initWebSocket() {
     ws.onmessage = (event) => {
       try {
         const cue = JSON.parse(event.data);
-        const validText = (cue?.translation && cue.translation !== "[stub transcript]") || (cue?.text && cue.text !== "[stub transcript]");
+        if (cue?.error) {
+          console.warn("[LiveSub Offscreen] Backend cue error:", cue.message || cue.error);
+          return;
+        }
+        const validTranslation = typeof cue?.translation === "string" && cue.translation.trim() && cue.translation !== "[stub transcript]";
+        const validTranscript = typeof cue?.text === "string" && cue.text.trim() && cue.text !== "[stub transcript]";
+        const validText = validTranslation || validTranscript;
         if (cue && validText) {
           deliverCueToTabs(cue);
         }
@@ -79,23 +85,19 @@ function initWebSocket() {
 }
 
 function deliverCueToTabs(cue) {
-  // 1. Direct message to target tab
-  if (currentTabId) {
-    chrome.tabs.sendMessage(currentTabId, { action: "SHOW_CUE", cue }).catch(() => {});
-  }
-
-  // 2. Fallback to active YouTube tabs in case targetTabId changed
-  try {
-    chrome.tabs.query({ url: "*://*.youtube.com/*" }, (tabs) => {
-      if (tabs && tabs.length > 0) {
-        tabs.forEach((t) => {
-          if (t.id && t.id !== currentTabId) {
-            chrome.tabs.sendMessage(t.id, { action: "SHOW_CUE", cue }).catch(() => {});
-          }
-        });
-      }
-    });
-  } catch (e) {}
+  chrome.runtime.sendMessage({
+    action: "DELIVER_CUE",
+    targetTabId: currentTabId,
+    cue,
+  }).then((result) => {
+    if (result?.error) {
+      console.warn("[LiveSub Offscreen] Cue delivery failed:", result.error);
+    } else {
+      console.log(`[LiveSub Offscreen] Cue delivered to tab ${currentTabId}: ${result?.status || "ok"}`);
+    }
+  }).catch((error) => {
+    console.warn("[LiveSub Offscreen] Could not relay cue to service worker:", error.message);
+  });
 }
 
 async function startCapture(config) {

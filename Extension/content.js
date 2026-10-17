@@ -13,6 +13,7 @@ let overlayContainer = null;
 let captionBox = null;
 let currentCueTimeout = null;
 let lastTranslatedText = "";
+let subtitleUpdateVersion = 0;
 let subtitleHistory = [];
 
 let captionPollInterval = null;
@@ -59,6 +60,7 @@ function showSubtitle(translation, original = null) {
     initOverlay();
   }
   if (!captionBox || !overlayContainer) return;
+  subtitleUpdateVersion += 1;
 
   let html = `<div class="livesub-translation">${escapeHtml(translation)}</div>`;
   if (original && original.trim() && original.trim() !== translation.trim() && original !== "[stub transcript]") {
