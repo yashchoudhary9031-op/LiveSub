@@ -120,7 +120,21 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 
 // Listen for messages from popup and content scripts
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  if (request.action === "START_AUDIO_SESSION") {
+  if (request.action === "DELIVER_CUE") {
+    const targetTabId = request.targetTabId || capturedTabId;
+    if (!targetTabId || !request.cue) {
+      sendResponse({ error: "Missing target tab or subtitle cue" });
+      return true;
+    }
+
+    chrome.tabs.sendMessage(targetTabId, { action: "SHOW_CUE", cue: request.cue })
+      .then((response) => sendResponse(response || { status: "delivered" }))
+      .catch((error) => {
+        console.warn(`[LiveSub] Could not deliver subtitle cue to tab ${targetTabId}:`, error.message);
+        sendResponse({ error: error.message });
+      });
+    return true;
+  } else if (request.action === "START_AUDIO_SESSION") {
     const tab = sender.tab || null;
     startSession(request.settings, tab);
     sendResponse({ status: "ok" });

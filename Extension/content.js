@@ -13,6 +13,7 @@ let overlayContainer = null;
 let captionBox = null;
 let currentCueTimeout = null;
 let lastTranslatedText = "";
+let subtitleUpdateVersion = 0;
 let subtitleHistory = [];
 
 let captionPollInterval = null;
@@ -59,6 +60,7 @@ function showSubtitle(translation, original = null) {
     initOverlay();
   }
   if (!captionBox || !overlayContainer) return;
+  subtitleUpdateVersion += 1;
 
   let html = `<div class="livesub-translation">${escapeHtml(translation)}</div>`;
   if (original && original !== translation && original !== "[stub transcript]") {
@@ -234,8 +236,9 @@ function startSubtitles() {
 
   // Show a brief badge so user sees LiveSub is ON
   showSubtitle("LiveSub Active 🟢", "");
+  const activeBadgeVersion = subtitleUpdateVersion;
   setTimeout(() => {
-    if (lastTranslatedText === "") hideSubtitle();
+    if (subtitleUpdateVersion === activeBadgeVersion) hideSubtitle();
   }, 1200);
 
   if (state.subMode === "caption_translate") {
