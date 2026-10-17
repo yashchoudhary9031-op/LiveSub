@@ -14,12 +14,16 @@ let captionBox = null;
 let currentCueTimeout = null;
 let lastTranslatedText = "";
 let subtitleHistory = [];
-let captionPollInterval = null;
+
+// Caption translate state
+let captionObserver = null;      // MutationObserver — fires <1ms on DOM change
+let captionFallbackInterval = null; // Fallback poll in case observer misses
 const translationCache = new Map();
 let requestId = 0;
+let pendingTranslation = false;
 
 // ----------------------------------------------------------------------------
-// 1. Initialize & Inject Overlay
+// 1. Overlay
 // ----------------------------------------------------------------------------
 function initOverlay() {
   if (document.getElementById("livesub-container")) {
@@ -28,7 +32,10 @@ function initOverlay() {
     return;
   }
 
-  const player = document.querySelector("#movie_player") || document.querySelector(".html5-video-player") || document.body;
+  const player =
+    document.querySelector("#movie_player") ||
+    document.querySelector(".html5-video-player") ||
+    document.body;
   if (!player) return;
 
   overlayContainer = document.createElement("div");
@@ -44,9 +51,7 @@ function initOverlay() {
 }
 
 function showSubtitle(translation, original = null) {
-  if (!captionBox || !overlayContainer) {
-    initOverlay();
-  }
+  if (!captionBox || !overlayContainer) initOverlay();
   if (!captionBox || !overlayContainer) return;
 
   let html = `<div class="livesub-translation">${escapeHtml(translation)}</div>`;
@@ -61,27 +66,16 @@ function showSubtitle(translation, original = null) {
 
 function recordSubtitle(translation, original, start, end) {
   if (!translation) return;
-
   const cueStart = Number.isFinite(Number(start)) ? Number(start) : (videoElement?.currentTime || 0);
-  const cueEnd = Number.isFinite(Number(end)) && Number(end) > cueStart
-    ? Number(end)
-    : cueStart + 2.5;
-  const cue = {
-    start: cueStart,
-    end: cueEnd,
-    original: original || "",
-    translation,
-  };
-  const previous = subtitleHistory[subtitleHistory.length - 1];
-
-  if (previous && previous.start === cue.start && previous.translation === cue.translation) return;
+  const cueEnd = Number.isFinite(Number(end)) && Number(end) > cueStart ? Number(end) : cueStart + 2.5;
+  const cue = { start: cueStart, end: cueEnd, original: original || "", translation };
+  const prev = subtitleHistory[subtitleHistory.length - 1];
+  if (prev && prev.start === cue.start && prev.translation === cue.translation) return;
   subtitleHistory.push(cue);
 }
 
 function hideSubtitle() {
-  if (overlayContainer) {
-    overlayContainer.classList.add("hidden");
-  }
+  overlayContainer?.classList.add("hidden");
 }
 
 function escapeHtml(text) {
@@ -91,7 +85,7 @@ function escapeHtml(text) {
 }
 
 // ----------------------------------------------------------------------------
-// 2. Video Player Binding
+// 2. Video Binding
 // ----------------------------------------------------------------------------
 function bindVideo() {
   videoElement = document.querySelector("video");
@@ -100,7 +94,6 @@ function bindVideo() {
   videoElement.removeEventListener("play", onPlay);
   videoElement.removeEventListener("pause", onPause);
   videoElement.removeEventListener("seeking", onSeeking);
-
   videoElement.addEventListener("play", onPlay);
   videoElement.addEventListener("pause", onPause);
   videoElement.addEventListener("seeking", onSeeking);
@@ -108,110 +101,140 @@ function bindVideo() {
 
 function onPlay() {
   chrome.runtime.sendMessage({ action: "VIDEO_STATUS", paused: false }).catch(() => {});
-  if (state.enabled) {
-    startSubtitles();
-  }
+  if (state.enabled) startSubtitles();
 }
-
 function onPause() {
   chrome.runtime.sendMessage({ action: "VIDEO_STATUS", paused: true }).catch(() => {});
-  if (state.subMode === "caption_translate") {
-    // Keep last caption during brief pause
-  }
 }
-
 function onSeeking() {
   hideSubtitle();
 }
 
 // ----------------------------------------------------------------------------
-// 3. Mode B: Translate Existing YouTube Captions (0 Delay)
+// 3. Caption Translate Mode — MutationObserver (ZERO polling delay)
 // ----------------------------------------------------------------------------
+
+// Direct Google Translate call — no backend, pure frontend, ~100ms cold / 0ms cached
 async function translateDirect(text, targetLang) {
   const cacheKey = `${targetLang}:${text}`;
   if (translationCache.has(cacheKey)) return translationCache.get(cacheKey);
 
-  const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${encodeURIComponent(targetLang)}&dt=t&q=${encodeURIComponent(text)}`;
-  const res = await fetch(url);
-  const data = await res.json();
-  const parts = (data[0] || []).map((s) => (s && s[0]) || "").join("");
-
-  if (parts) {
-    if (translationCache.size > 500) {
-      translationCache.delete(translationCache.keys().next().value);
+  try {
+    const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${encodeURIComponent(targetLang)}&dt=t&q=${encodeURIComponent(text)}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const parts = (data[0] || []).map((s) => (s && s[0]) || "").join("");
+    if (parts) {
+      if (translationCache.size > 800) translationCache.delete(translationCache.keys().next().value);
+      translationCache.set(cacheKey, parts);
+      return parts;
     }
-    translationCache.set(cacheKey, parts);
-    return parts;
+  } catch (e) {
+    // Silently swallow — return original
   }
   return text;
 }
 
-function preCacheVisibleCaptions(targetLang) {
+// Pre-warm translation cache for ALL visible caption segments ahead of time
+function preCacheAllVisibleCaptions() {
   const allSegments = document.querySelectorAll(".ytp-caption-segment");
   allSegments.forEach((el) => {
     const t = el.innerText?.trim();
-    const cacheKey = `${targetLang}:${t}`;
-    if (t && !translationCache.has(cacheKey)) {
-      translateDirect(t, targetLang).catch(() => {});
+    if (t && t.length > 1) {
+      const cacheKey = `${state.targetLang}:${t}`;
+      if (!translationCache.has(cacheKey)) {
+        translateDirect(t, state.targetLang).catch(() => {});
+      }
     }
   });
+}
+
+// Called whenever YouTube caption DOM changes — fires in <1ms
+async function onCaptionMutation() {
+  if (!state.enabled || state.subMode !== "caption_translate") return;
+
+  // Grab the text from any of YouTube's possible caption selectors
+  const captionEl =
+    document.querySelector(".ytp-caption-segment") ||
+    document.querySelector(".ytp-caption-window-container .caption-visual-line") ||
+    document.querySelector(".caption-window span");
+
+  if (!captionEl) return;
+
+  const rawText = captionEl.innerText?.trim();
+  if (!rawText || rawText === lastTranslatedText) return;
+
+  lastTranslatedText = rawText;
+  const myRequestId = ++requestId;
+
+  // Pre-warm other visible captions in parallel (no await — background fire-and-forget)
+  preCacheAllVisibleCaptions();
+
+  const cacheKey = `${state.targetLang}:${rawText}`;
+
+  // INSTANT CACHE HIT — show translation with zero delay
+  if (translationCache.has(cacheKey)) {
+    if (myRequestId !== requestId) return;
+    const cached = translationCache.get(cacheKey);
+    showSubtitle(cached, rawText);
+    recordSubtitle(cached, rawText, videoElement?.currentTime, (videoElement?.currentTime || 0) + 2.5);
+    return;
+  }
+
+  // Cache MISS: show original text immediately while translation loads
+  showSubtitle(rawText, "");
+
+  try {
+    const translation = await translateDirect(rawText, state.targetLang);
+    if (myRequestId !== requestId) return; // stale — a newer caption arrived
+    showSubtitle(translation, rawText);
+    recordSubtitle(translation, rawText, videoElement?.currentTime, (videoElement?.currentTime || 0) + 2.5);
+  } catch (e) { /* next caption will retry */ }
 }
 
 function startCaptionObserver() {
   stopCaptionObserver();
 
-  captionPollInterval = setInterval(async () => {
-    if (!state.enabled || state.subMode !== "caption_translate") return;
+  // ─── MutationObserver: fires the INSTANT YouTube updates caption text ───
+  // This is MUCH faster than setInterval — no polling lag at all.
+  const captionContainer =
+    document.querySelector(".ytp-caption-window-container") ||
+    document.querySelector(".caption-window") ||
+    document.body;
 
-    const captionEl =
-      document.querySelector(".ytp-caption-segment") ||
-      document.querySelector(".ytp-caption-window-container .caption-visual-line") ||
-      document.querySelector(".caption-window span");
+  captionObserver = new MutationObserver(() => {
+    onCaptionMutation();
+  });
 
-    if (!captionEl) return;
+  captionObserver.observe(captionContainer, {
+    childList: true,
+    subtree: true,
+    characterData: true,
+  });
 
-    const rawText = captionEl.innerText?.trim();
-    if (!rawText || rawText === lastTranslatedText) return;
+  // ─── Lightweight fallback interval (50ms) in case observer misses changes ───
+  // e.g. when switching caption tracks or after seeking
+  captionFallbackInterval = setInterval(onCaptionMutation, 50);
 
-    lastTranslatedText = rawText;
-    const myRequestId = ++requestId;
-
-    preCacheVisibleCaptions(state.targetLang);
-
-    const cacheKey = `${state.targetLang}:${rawText}`;
-    if (translationCache.has(cacheKey)) {
-      if (myRequestId === requestId) {
-        const cached = translationCache.get(cacheKey);
-        showSubtitle(cached, rawText);
-        recordSubtitle(cached, rawText, videoElement?.currentTime, (videoElement?.currentTime || 0) + 2.5);
-      }
-      return;
-    }
-
-    // Immediately show original while translation loads
-    showSubtitle(rawText, "");
-
-    try {
-      const translation = await translateDirect(rawText, state.targetLang);
-      if (myRequestId === requestId) {
-        showSubtitle(translation, rawText);
-        recordSubtitle(translation, rawText, videoElement?.currentTime, (videoElement?.currentTime || 0) + 2.5);
-      }
-    } catch (e) {}
-  }, 150);
+  console.log("[LiveSub] Caption observer active (MutationObserver + 50ms fallback)");
 }
 
 function stopCaptionObserver() {
-  if (captionPollInterval) {
-    clearInterval(captionPollInterval);
-    captionPollInterval = null;
+  if (captionObserver) {
+    captionObserver.disconnect();
+    captionObserver = null;
+  }
+  if (captionFallbackInterval) {
+    clearInterval(captionFallbackInterval);
+    captionFallbackInterval = null;
   }
   requestId = 0;
   lastTranslatedText = "";
 }
 
 // ----------------------------------------------------------------------------
-// 4. Master Lifecycle (Start / Stop)
+// 4. Master Lifecycle
 // ----------------------------------------------------------------------------
 function startSubtitles() {
   initOverlay();
@@ -233,25 +256,16 @@ function stopSubtitles() {
 // 5. Settings, Export & Cue Listener
 // ----------------------------------------------------------------------------
 chrome.storage.local.get(
-  {
-    enabled: false,
-    targetLang: "hi",
-    langHint: "",
-    subMode: "audio_stt",
-    fontSize: "22px",
-  },
+  { enabled: false, targetLang: "hi", langHint: "", subMode: "audio_stt", fontSize: "22px" },
   (saved) => {
     state = saved;
     initOverlay();
     bindVideo();
-    if (state.enabled && videoElement && !videoElement.paused) {
-      startSubtitles();
-    }
+    if (state.enabled && videoElement && !videoElement.paused) startSubtitles();
   }
 );
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  // 1. Export Subtitles history requested by popup
   if (request.action === "EXPORT_SUBTITLES") {
     sendResponse({
       subtitles: subtitleHistory,
@@ -260,7 +274,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
 
-  // 2. Subtitle Cue received from offscreen.js (Live Audio STT)
   if (request.action === "SHOW_CUE" && request.cue) {
     const cue = request.cue;
     if (cue.translation && cue.translation.trim() && cue.translation !== "[stub transcript]") {
@@ -268,39 +281,35 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       recordSubtitle(cue.translation, cue.text, cue.start, cue.end);
 
       if (currentCueTimeout) clearTimeout(currentCueTimeout);
-      // Keep visible for 2.2 seconds so consecutive 1.5s chunks transition seamlessly
-      currentCueTimeout = setTimeout(() => {
-        hideSubtitle();
-      }, 2200);
+      // Keep subtitle visible for 2s — overlaps the next 1.5s chunk seamlessly
+      currentCueTimeout = setTimeout(hideSubtitle, 2000);
     }
     sendResponse({ status: "ok" });
     return true;
   }
 
-  // 3. Settings changed from popup
   if (request.action === "SETTINGS_CHANGED") {
+    const prevLang = state.targetLang;
     state = request.settings;
-    if (captionBox) {
-      captionBox.style.fontSize = state.fontSize || "22px";
-    }
+    if (captionBox) captionBox.style.fontSize = state.fontSize || "22px";
 
-    if (state.enabled) {
-      startSubtitles();
-    } else {
-      stopSubtitles();
-    }
+    // If language changed, clear cache so stale translations don't show
+    if (prevLang !== state.targetLang) translationCache.clear();
+
+    if (state.enabled) startSubtitles();
+    else stopSubtitles();
+
     sendResponse({ status: "ok" });
     return true;
   }
 });
 
-// Re-hook on YouTube SPA navigation
+// Re-attach on YouTube SPA navigation
 window.addEventListener("yt-navigate-finish", () => {
   subtitleHistory = [];
   lastTranslatedText = "";
+  translationCache.clear(); // New video = new content = fresh cache
   initOverlay();
   bindVideo();
-  if (state.enabled && videoElement && !videoElement.paused) {
-    startSubtitles();
-  }
+  if (state.enabled && videoElement && !videoElement.paused) startSubtitles();
 });

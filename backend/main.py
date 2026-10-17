@@ -8,7 +8,9 @@ transcription, translation, and video-synchronized subtitle cue delivery.
 import os
 import json
 import time
+import asyncio
 import logging
+from functools import partial
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -245,6 +247,10 @@ async def websocket_stream(websocket: WebSocket):
                         })
                         continue
 
+                    # Ignore keepalive ping messages from extension
+                    if payload.get("ping"):
+                        continue
+
                     if "chunk_start" in payload:
                         session_config["chunk_start"] = float(payload["chunk_start"])
                     if "rate" in payload:
@@ -264,14 +270,23 @@ async def websocket_stream(websocket: WebSocket):
             elif "bytes" in message and message["bytes"] is not None:
                 audio_bytes = message["bytes"]
                 try:
-                    cue = build_cue(
-                        audio_bytes=audio_bytes,
-                        chunk_start=session_config["chunk_start"],
-                        rate=session_config["rate"],
-                        target_lang=session_config["target_lang"],
-                        lang_hint=session_config["lang_hint"],
+                    # Run synchronous Groq STT + Google Translate in thread pool
+                    # so the async event loop is NEVER blocked — zero WebSocket stall
+                    loop = asyncio.get_event_loop()
+                    cue = await loop.run_in_executor(
+                        None,
+                        partial(
+                            build_cue,
+                            audio_bytes=audio_bytes,
+                            chunk_start=session_config["chunk_start"],
+                            rate=session_config["rate"],
+                            target_lang=session_config["target_lang"],
+                            lang_hint=session_config["lang_hint"],
+                        ),
                     )
-                    await websocket.send_json(cue)
+                    # Only send if there's actual content — skip silent/empty chunks
+                    if cue.get("translation") or cue.get("text"):
+                        await websocket.send_json(cue)
                 except Exception as exc:
                     logger.error(f"Error processing audio in WebSocket: {exc}")
                     await websocket.send_json({

@@ -36,6 +36,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 });
 
+let wsPingInterval = null;
+
 function initWebSocket() {
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
     return;
@@ -46,6 +48,13 @@ function initWebSocket() {
 
     ws.onopen = () => {
       console.log("[LiveSub Offscreen] WebSocket connected to backend");
+      // Keepalive ping every 15s — prevents silent connection drops
+      if (wsPingInterval) clearInterval(wsPingInterval);
+      wsPingInterval = setInterval(() => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ ping: true }));
+        }
+      }, 15000);
     };
 
     ws.onmessage = (event) => {
@@ -70,9 +79,9 @@ function initWebSocket() {
 
     ws.onclose = () => {
       ws = null;
-      // Auto-reconnect if recording is still active
+      // Fast auto-reconnect — 300ms not 2000ms so audio flow resumes instantly
       if (isRecording) {
-        setTimeout(initWebSocket, 2000);
+        setTimeout(initWebSocket, 300);
       }
     };
   } catch (err) {
