@@ -2,7 +2,7 @@
 
 const BACKEND_WS = "ws://localhost:8000/ws";
 const BACKEND_HTTP = "http://localhost:8000";
-const CHUNK_DURATION_MS = 1000; // 1.0s slice for lightning fast Whisper STT (<1.1s total turnaround)
+const CHUNK_DURATION_MS = 1800; // 1.8s slice: complete phrases, zero word-splitting, rock-solid Whisper STT
 
 let mediaStream = null;
 let audioContext = null;
@@ -56,7 +56,10 @@ function initWebSocket() {
           console.warn("[LiveSub Offscreen] Backend cue error:", cue.message || cue.error);
           return;
         }
-        if (cue && cue.translation && cue.translation.trim() && cue.translation !== "[stub transcript]") {
+        const validTranslation = typeof cue?.translation === "string" && cue.translation.trim() && cue.translation !== "[stub transcript]";
+        const validTranscript = typeof cue?.text === "string" && cue.text.trim() && cue.text !== "[stub transcript]";
+        const validText = validTranslation || validTranscript;
+        if (cue && validText) {
           deliverCueToTabs(cue);
         }
       } catch (e) {
@@ -218,7 +221,8 @@ async function sendAudioSlice(blob) {
 
       if (res.ok) {
         const cue = await res.json();
-        if (cue && cue.translation && cue.translation.trim() && cue.translation !== "[stub transcript]") {
+        const validText = (cue?.translation && cue.translation !== "[stub transcript]") || (cue?.text && cue.text !== "[stub transcript]");
+        if (cue && validText) {
           deliverCueToTabs(cue);
         }
       }

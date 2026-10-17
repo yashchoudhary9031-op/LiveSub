@@ -62,13 +62,21 @@ def _transcribe_groq(audio_bytes: bytes, lang_hint: Optional[str] = None) -> Dic
             "response_format": "verbose_json",
             "temperature": 0.0,
         }
-        if lang_hint:
-            params["language"] = lang_hint
+        if lang_hint and lang_hint.strip() and lang_hint.lower() != "auto":
+            params["language"] = lang_hint.strip()
 
-        result = client.audio.transcriptions.create(**params)
-        raw_text = getattr(result, "text", "") or ""
-        detected_lang = getattr(result, "language", lang_hint or "en") or "en"
-        duration = getattr(result, "duration", 1.5) or 1.5
+        # Try with_raw_response to preserve full response fields including detected language
+        try:
+            raw_resp = client.audio.transcriptions.with_raw_response.create(**params)
+            data = raw_resp.json() if hasattr(raw_resp, "json") else {}
+            raw_text = data.get("text", "") or ""
+            detected_lang = data.get("language") or lang_hint or "auto"
+            duration = data.get("duration", 1.5) or 1.5
+        except Exception:
+            result = client.audio.transcriptions.create(**params)
+            raw_text = getattr(result, "text", "") or ""
+            detected_lang = getattr(result, "language", None) or lang_hint or "auto"
+            duration = getattr(result, "duration", 1.5) or 1.5
 
         # Filter out common Whisper silence hallucinations
         hallucinations = {
@@ -134,18 +142,22 @@ def _get_http_client():
     return _http_client
 
 
-def _translate_google(text: str, src: str, target: str) -> str:
+def _translate_google_with_lang(text: str, src: str, target: str) -> tuple[str, str]:
     """
     Real-time translation using Google Translate endpoint via persistent httpx client.
-    Supports 100+ languages with zero API keys required and ~30ms response time.
+    Supports 100+ languages with zero API keys required, ~30ms response time,
+    and automatic source language detection.
+    Returns (translated_text, detected_language).
     """
     if not text or not text.strip():
-        return ""
-    if src == target:
-        return text
+        return "", (src if src and src.lower() != "auto" else "en")
 
-    sl_code = src if src and src.lower() != "auto" else "auto"
-    tl_code = target if target else "en"
+    sl_code = src.strip().lower() if src and src.strip().lower() not in ["auto", ""] else "auto"
+    tl_code = target.strip() if target else "en"
+
+    # If source is explicitly given and matches target, no translation needed
+    if sl_code != "auto" and sl_code == tl_code.lower():
+        return text, sl_code
 
     try:
         url = "https://translate.googleapis.com/translate_a/single"
@@ -163,15 +175,25 @@ def _translate_google(text: str, src: str, target: str) -> str:
         resp = client.get(url, params=params, headers=headers)
         if resp.status_code == 200:
             data = resp.json()
+            # data[2] is Google's auto-detected language code (e.g. 'en', 'hi', 'es', 'ja', 'de')
+            detected = data[2] if (len(data) > 2 and data[2]) else (sl_code if sl_code != "auto" else "en")
+
             if data and isinstance(data, list) and len(data) > 0 and isinstance(data[0], list):
                 parts = [segment[0] for segment in data[0] if segment and len(segment) > 0 and segment[0]]
                 if parts:
-                    return "".join(parts)
+                    return "".join(parts), str(detected)
     except Exception:
         pass
 
     # Fallback if network or endpoint fails
-    return _translate_stub(text, src, target)
+    fallback = _translate_stub(text, sl_code, tl_code)
+    return fallback, (sl_code if sl_code != "auto" else "en")
+
+
+def _translate_google(text: str, src: str, target: str) -> str:
+    """Convenience wrapper returning translated text only."""
+    translated, _ = _translate_google_with_lang(text, src, target)
+    return translated
 
 
 def translate(text: str, src: str, target: str, provider: Optional[str] = None) -> str:
@@ -206,19 +228,36 @@ def build_cue(
     Process an audio chunk and construct a synchronized subtitle cue.
 
     1. Transcribe the audio chunk (recovering text, detected language, and chunk duration).
-    2. Translate the transcript into target_lang.
+    2. Translate the transcript into target_lang with auto-source detection.
     3. Compute video timeline start and end timestamps using to_video_time().
     4. Return cue dictionary conforming to Cue schema.
     """
     stt_res = transcribe(audio_bytes, lang_hint=lang_hint)
     original_text = stt_res.get("text", "")
-    detected_lang = stt_res.get("lang", lang_hint or "hi")
+    stt_lang = stt_res.get("lang") or "auto"
     audio_duration = float(stt_res.get("duration", 2.0))
 
     if not original_text or not original_text.strip():
         translated_text = ""
+        final_lang = lang_hint or (stt_lang if stt_lang != "auto" else "en")
     else:
-        translated_text = translate(original_text, src=detected_lang, target=target_lang)
+        active_provider = get_translate_provider().lower()
+        # If user explicitly provided a hint, use it; otherwise pass 'auto' for auto-detection
+        src_for_trans = lang_hint if (lang_hint and lang_hint.strip() and lang_hint.lower() != "auto") else "auto"
+
+        if active_provider in ["google", "real"]:
+            translated_text, final_lang = _translate_google_with_lang(
+                original_text, src=src_for_trans, target=target_lang
+            )
+            # Guarantee user always sees text: fallback to original if translation is empty
+            if not translated_text or not translated_text.strip():
+                translated_text = original_text
+        elif active_provider == "stub":
+            # In stub mode (tests), keep expected deterministic format
+            final_lang = lang_hint or "hi"
+            translated_text = _translate_stub(original_text, src=final_lang, target=target_lang)
+        else:
+            raise NotImplementedError(f"Translate provider '{active_provider}' is not implemented yet.")
 
     # Convert audio offsets to video timeline seconds
     start_time = to_video_time(chunk_start, 0.0, rate)
@@ -227,7 +266,7 @@ def build_cue(
     return {
         "start": start_time,
         "end": end_time,
-        "lang": detected_lang,
+        "lang": final_lang,
         "text": original_text,
         "translation": translated_text,
         "source": "stt",

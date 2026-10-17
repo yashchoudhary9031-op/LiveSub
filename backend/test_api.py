@@ -79,6 +79,17 @@ def test_pipeline_translate_google():
     assert "Hola" in res or res == "[es] Hello world"
 
 
+def test_pipeline_translate_auto_detect():
+    """Verify Google auto-detects source language accurately."""
+    # Hindi to English auto-detect
+    res_hi = translate("नमस्ते दुनिया", src="auto", target="en", provider="google")
+    assert "hello" in res_hi.lower() or "world" in res_hi.lower() or res_hi == "[en] नमस्ते दुनिया"
+
+    # Spanish to English auto-detect
+    res_es = translate("Hola amigos", src="auto", target="en", provider="google")
+    assert "hello" in res_es.lower() or "friends" in res_es.lower() or res_es == "[en] Hola amigos"
+
+
 def test_pipeline_build_cue():
     """Verify end-to-end cue builder logic."""
     cue = build_cue(

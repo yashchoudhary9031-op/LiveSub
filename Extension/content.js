@@ -63,7 +63,7 @@ function showSubtitle(translation, original = null) {
   subtitleUpdateVersion += 1;
 
   let html = `<div class="livesub-translation">${escapeHtml(translation)}</div>`;
-  if (original && original !== translation && original !== "[stub transcript]") {
+  if (original && original.trim() && original.trim() !== translation.trim() && original !== "[stub transcript]") {
     html += `<div class="livesub-original">${escapeHtml(original)}</div>`;
   }
 
@@ -111,8 +111,8 @@ function bindVideo() {
 }
 
 function onPlay() {
-  if (state.enabled) {
-    startSubtitles();
+  if (state.enabled && !document.body.classList.contains("livesub-active")) {
+    startSubtitles(false);
   }
 }
 
@@ -176,10 +176,14 @@ function startCaptionObserver() {
 
     // Use textContent so opacity: 0 does not block text extraction
     const rawText = (captionEl.textContent || captionEl.innerText || "").trim();
-    if (!rawText || rawText === lastTranslatedText) return;
+    if (!rawText) return;
+
+    // Continuously mark CC as active so Audio STT does not collide or overwrite
+    lastCaptionTime = Date.now();
+
+    if (rawText === lastTranslatedText) return;
 
     lastTranslatedText = rawText;
-    lastCaptionTime = Date.now();
     const myRequestId = ++requestId;
 
     preCacheVisibleSegments();
@@ -221,7 +225,7 @@ function stopCaptionObserver() {
 // ----------------------------------------------------------------------------
 // 4. Master Lifecycle (Start / Stop)
 // ----------------------------------------------------------------------------
-function startSubtitles() {
+function startSubtitles(showWelcomeBadge = true) {
   initOverlay();
   bindVideo();
 
@@ -234,12 +238,17 @@ function startSubtitles() {
 
   document.body.classList.add("livesub-active");
 
-  // Show a brief badge so user sees LiveSub is ON
-  showSubtitle("LiveSub Active 🟢", "");
-  const activeBadgeVersion = subtitleUpdateVersion;
-  setTimeout(() => {
-    if (subtitleUpdateVersion === activeBadgeVersion) hideSubtitle();
-  }, 1200);
+  // Show a brief badge only on initial startup, never overriding subtitles on play/resume
+  if (showWelcomeBadge) {
+    showSubtitle("LiveSub Active 🟢", "");
+    if (currentCueTimeout) clearTimeout(currentCueTimeout);
+    currentCueTimeout = setTimeout(() => {
+      const currentHTML = captionBox?.innerHTML || "";
+      if (currentHTML.includes("LiveSub Active")) {
+        hideSubtitle();
+      }
+    }, 2000);
+  }
 
   if (state.subMode === "caption_translate") {
     // CC only
@@ -291,19 +300,27 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   // 2. Subtitle Cue from Audio STT (offscreen.js)
   if (request.action === "SHOW_CUE" && request.cue) {
     const cue = request.cue;
-    // In auto mode, if YouTube CC was active in the last 2 seconds, ignore STT to avoid collisions
-    if (state.subMode === "auto" && Date.now() - lastCaptionTime < 2000) {
+    // In auto mode, if YouTube CC was active in the last 4 seconds, ignore STT to avoid collisions
+    if (state.subMode === "auto" && Date.now() - lastCaptionTime < 4000) {
       sendResponse({ status: "skipped_for_cc" });
       return true;
     }
 
-    if (cue.translation && cue.translation.trim() && cue.translation !== "[stub transcript]") {
-      showSubtitle(cue.translation, cue.text);
-      recordSubtitle(cue.translation, cue.text, cue.start, cue.end);
+    const displayText = (cue.translation && cue.translation.trim() && cue.translation !== "[stub transcript]")
+      ? cue.translation.trim()
+      : (cue.text && cue.text.trim() && cue.text !== "[stub transcript]" ? cue.text.trim() : "");
+
+    if (displayText) {
+      showSubtitle(displayText, cue.text);
+      recordSubtitle(displayText, cue.text, cue.start, cue.end);
 
       if (currentCueTimeout) clearTimeout(currentCueTimeout);
-      // Keep visible for 2.2s so sequential 1.0s audio chunks overlap smoothly
-      currentCueTimeout = setTimeout(hideSubtitle, 2200);
+      // Keep visible for 7 seconds so sequential audio chunks overlap seamlessly and subtitles never vanish
+      currentCueTimeout = setTimeout(() => {
+        if (videoElement && !videoElement.paused) {
+          hideSubtitle();
+        }
+      }, 7000);
     }
     sendResponse({ status: "ok" });
     return true;
